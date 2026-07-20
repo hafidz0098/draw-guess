@@ -1,0 +1,177 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply antialiased scroll-smooth;
+    font-family: 'Nunito', system-ui, sans-serif;
+    color-scheme: dark;
+    background-color: #0f172a;
+  }
+
+  body {
+    @apply min-h-screen bg-slate-900 text-slate-100;
+  }
+
+  * {
+    @apply border-slate-700;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl font-bold
+      transition-all duration-200 ease-out
+      focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+      disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.97];
+  }
+
+  .btn-primary {
+    @apply btn bg-brand-orange-500 text-white hover:bg-brand-orange-600
+      focus-visible:ring-brand-orange-400 px-5 py-2.5 shadow-card;
+  }
+
+  .btn-secondary {
+    @apply btn bg-brand-blue-500 text-white hover:bg-brand-blue-600
+      focus-visible:ring-brand-blue-400 px-5 py-2.5 shadow-card;
+  }
+
+  .btn-outline {
+    @apply btn border-2 border-slate-600 bg-slate-800 px-5 py-2.5 text-slate-100
+      hover:bg-slate-700 hover:border-slate-500;
+  }
+
+  .btn-ghost {
+    @apply btn bg-transparent px-3 py-2 text-slate-100 hover:bg-slate-800;
+  }
+
+  .nav-link {
+    @apply text-slate-100;
+  }
+
+  .btn-danger {
+    @apply btn bg-red-500 text-white hover:bg-red-600 px-5 py-2.5;
+  }
+
+  .btn-sm {
+    @apply text-sm px-3 py-1.5 rounded-lg;
+  }
+
+  .btn-lg {
+    @apply text-lg px-7 py-3.5 rounded-2xl;
+  }
+
+  .card {
+    @apply rounded-2xl border border-slate-700 bg-slate-800 shadow-card;
+  }
+
+  .card-hover {
+    @apply card hover:shadow-card-hover transition-shadow duration-200;
+  }
+
+  .input {
+    @apply w-full rounded-xl border-2 border-slate-600 bg-slate-900 px-4 py-2.5
+      text-slate-100 placeholder:text-slate-500
+      focus:outline-none focus:border-brand-orange-500 focus:ring-2 focus:ring-brand-orange-900/40
+      transition-colors duration-200;
+  }
+
+  .label {
+    @apply mb-1.5 block text-sm font-bold text-slate-300;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-lg px-2 py-0.5 text-xs font-bold;
+  }
+
+  .badge-orange {
+    @apply badge bg-brand-orange-100 text-brand-orange-700 dark:bg-brand-orange-900/40 dark:text-brand-orange-300;
+  }
+
+  .badge-blue {
+    @apply badge bg-brand-blue-100 text-brand-blue-700 dark:bg-brand-blue-900/40 dark:text-brand-blue-300;
+  }
+
+  .badge-green {
+    @apply badge bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300;
+  }
+
+  .badge-purple {
+    @apply badge bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300;
+  }
+
+  .page-container {
+    @apply mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6;
+  }
+
+  .section-title {
+    @apply text-2xl font-black text-white sm:text-3xl;
+  }
+}
+
+/* Page transitions */
+.page-enter-active,
+.page-leave-active {
+  transition: all 0.25s ease;
+}
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.page-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.layout-enter-active,
+.layout-leave-active {
+  transition: opacity 0.2s ease;
+}
+.layout-enter-from,
+.layout-leave-to {
+  opacity: 0;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-300 rounded-full dark:bg-slate-600;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-slate-400 dark:bg-slate-500;
+}
+
+/* Canvas container */
+.canvas-container {
+  @apply relative overflow-hidden rounded-2xl bg-white border-2 border-slate-200
+    dark:bg-slate-900 dark:border-slate-700 touch-none;
+}
+
+/* Chat message styles */
+.chat-correct {
+  @apply bg-emerald-50 text-emerald-700 font-bold dark:bg-emerald-900/30 dark:text-emerald-300;
+}
+
+/* Word display */
+.word-letter {
+  @apply inline-flex items-center justify-center w-8 h-10 sm:w-10 sm:h-12
+    rounded-lg bg-surface-tertiary border-2 border-slate-200
+    font-black text-lg sm:text-xl text-slate-700
+    dark:bg-slate-700 dark:border-slate-600 dark:text-slate-200;
+}
+
+/* Timer pulse */
+.timer-urgent {
+  animation: pulse-urgent 1s ease-in-out infinite;
+}
+@keyframes pulse-urgent {
+  0%, 100% { color: #ef4444; transform: scale(1); }
+  50% { color: #dc2626; transform: scale(1.05); }
+}
