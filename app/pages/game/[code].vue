@@ -52,6 +52,13 @@ let resizeObs: ResizeObserver | null = null
 /** Dedupe remote live paints by seq */
 const seenLiveSeq = new Set<number>()
 const seenCommitKey = new Set<string>()
+/**
+ * Shared drawing session id (from word_selected).
+ * Both drawer & guesser must use the same value for stroke relay.
+ */
+const drawingSessionId = ref('')
+/** While true, setupCanvas must not wipe pixels (live strokes in flight) */
+let protectCanvas = false
 
 const channel = useRoomChannel(computed(() => room.value?.id))
 
@@ -168,14 +175,12 @@ onUnmounted(() => {
   if (liveThrottle) clearTimeout(liveThrottle)
 })
 
-/** Active round id for filtering stale relay strokes */
-const activeRoundId = computed(() => roomStore.currentRound?.id || '')
-
 /**
  * Blank the board completely (store + pixels + dedupe).
  * broadcast=true also clears server stroke buffer so poll won't re-stack old art.
  */
 function resetDrawingSurface(opts?: { broadcast?: boolean }) {
+  protectCanvas = false
   game.wipeStrokes()
   seenLiveSeq.clear()
   seenCommitKey.clear()
@@ -193,11 +198,8 @@ function resetDrawingSurface(opts?: { broadcast?: boolean }) {
     ctx.globalAlpha = 1
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H)
-  } else {
-    nextTick(() => setupCanvas(true))
   }
-  // Always re-run full setup so buffer size + white fill is consistent
-  nextTick(() => setupCanvas(true))
+  setupCanvas(true)
 }
 
 function handleGameEvent(type: string, data: Record<string, unknown>) {
@@ -206,6 +208,7 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
     const dId = String(data.drawerId || '')
     const rn = Number(data.roundNumber) || 1
 
+    drawingSessionId.value = ''
     // Wipe previous drawer's art for everyone (including host)
     resetDrawingSurface({ broadcast: type === 'next_round' && isHost.value })
 
@@ -234,21 +237,35 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
     })
   } else if (type === 'word_selected') {
     const dId = String(data.drawerId || '')
-    if (auth.user?.id && dId === auth.user.id) return
-    // Fresh canvas for guessers — never reset poll to 0 (would re-apply old rounds)
+    if (auth.user?.id && dId === auth.user.id) {
+      // Drawer already picked locally — still lock drawing session id
+      const rid = String(data.roundId || roomStore.currentRound?.id || '')
+      if (rid) drawingSessionId.value = rid
+      protectCanvas = true
+      return
+    }
+    const rid = String(data.roundId || '')
+    drawingSessionId.value = rid || drawingSessionId.value
+    // Fresh canvas once — NO delayed setupCanvas (that wiped live strokes)
     resetDrawingSurface({ broadcast: false })
     game.onRemoteWordSelected({
       word: String(data.word || ''),
       drawerId: dId,
       drawTime: Number(data.drawTime) || 60,
-      roundId: data.roundId as string | undefined,
+      roundId: rid || undefined,
     })
+    protectCanvas = true
     nextTick(() => {
       setupCanvas(true)
-      setTimeout(() => setupCanvas(true), 80)
+      protectCanvas = true
     })
   } else if (type === 'canvas_clear' || type === 'clear_canvas') {
-    resetDrawingSurface({ broadcast: false })
+    // Drawer cleared board mid-round
+    game.wipeStrokes()
+    seenLiveSeq.clear()
+    seenCommitKey.clear()
+    setupCanvas(true)
+    protectCanvas = phase.value === 'drawing'
   } else if (type === 'game_over') {
     if (Array.isArray(data.scores)) {
       for (const s of data.scores as { user_id: string; score: number }[]) {
@@ -256,40 +273,57 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
         if (m) m.score = s.score
       }
     }
+    protectCanvas = false
     resetDrawingSurface({ broadcast: false })
     game.finishGame()
   }
 }
 
-function strokeBelongsToActiveRound(s: DrawingStroke): boolean {
+/**
+ * Accept strokes for the active draw turn.
+ * Prefer matching drawingSessionId, but NEVER drop strokes while drawing
+ * if session ids diverged (that was the main realtime bug).
+ */
+function strokeBelongsToActiveDraw(s: DrawingStroke): boolean {
+  if (phase.value !== 'drawing' && phase.value !== 'revealing') {
+    // Outside drawing, only allow clear
+    return !!(s.shape_data as { clear?: boolean } | null)?.clear
+  }
   const rid = s.round_id
   if (!rid || rid === 'live' || rid === 'clear') return true
-  const active = activeRoundId.value
-  if (!active) return true
-  // Accept if matches current round
-  if (rid === active) return true
-  // Reject clearly foreign round ids (uuid from previous rounds)
-  return false
+  const session = drawingSessionId.value || roomStore.currentRound?.id || ''
+  // Matching session → always ok
+  if (session && rid === session) return true
+  // During active draw: accept strokes even if ids drifted (sync bug safety)
+  // Stale previous-round strokes should have been cleared from server buffer.
+  return true
 }
 
 function handleRemoteStrokes(remote: DrawingStroke[]) {
-  // Clear signal — always apply (even if we are/were drawer)
+  // Clear signal — wipe board (drawer Clear button / new word buffer clear)
   if (remote.some(s => s.shape_data && (s.shape_data as { clear?: boolean }).clear)) {
     game.wipeStrokes()
     seenLiveSeq.clear()
     seenCommitKey.clear()
     setupCanvas(true)
+    protectCanvas = phase.value === 'drawing'
     return
   }
 
-  // Drawer paints locally only — ignore remote ink (but clear above still runs)
+  // Drawer paints locally only — ignore remote ink
   if (isDrawer.value) return
+  // Must be in drawing to show ink
+  if (phase.value !== 'drawing' && phase.value !== 'revealing') return
 
-  ensureCtxReady()
+  if (!ensureCtxReady()) {
+    setupCanvas(true)
+  }
+  protectCanvas = true
 
+  let painted = 0
   for (const s of remote) {
     if (!s.points || s.points.length < 2) continue
-    if (!strokeBelongsToActiveRound(s)) continue
+    if (!strokeBelongsToActiveDraw(s)) continue
 
     const meta = (s.shape_data || {}) as {
       live?: boolean
@@ -300,31 +334,46 @@ function handleRemoteStrokes(remote: DrawingStroke[]) {
     const isLive = !!meta.live || s.sequence < 0
 
     if (isLive) {
+      // Dedupe by seq only (negative ids)
       if (seenLiveSeq.has(s.sequence)) continue
       seenLiveSeq.add(s.sequence)
-      // Cap set size
-      if (seenLiveSeq.size > 2000) {
-        const arr = [...seenLiveSeq].slice(-500)
+      if (seenLiveSeq.size > 4000) {
+        const arr = [...seenLiveSeq].slice(-800)
         seenLiveSeq.clear()
         arr.forEach(n => seenLiveSeq.add(n))
       }
     } else {
-      const key = `${s.sequence}:${s.timestamp_ms}`
+      const key = `${s.sequence}:${Math.round(s.timestamp_ms || 0)}`
       if (seenCommitKey.has(key)) continue
       seenCommitKey.add(key)
-      game.applyRemoteStrokes([s])
+      // Store for replay on resize — mark as normalized
+      game.applyRemoteStrokes([{
+        ...s,
+        shape_data: {
+          ...(s.shape_data || {}),
+          normalized: meta.normalized ?? true,
+          canvas_w: meta.canvas_w,
+          canvas_h: meta.canvas_h,
+        },
+      }])
     }
 
-    const localPts = toLocalPoints(s.points, meta)
+    const localPts = toLocalPoints(s.points, {
+      ...meta,
+      normalized: meta.normalized ?? true,
+    })
     paintSegment(
       localPts,
       s.color || '#000000',
       s.size || 6,
       !!(s.is_eraser || s.tool === 'eraser'),
     )
+    painted++
   }
 
-  statusMsg.value = `stroke in · rt:${channel.channelStatus()}`
+  if (painted) {
+    statusMsg.value = `stroke+${painted} · rt:${channel.channelStatus()}`
+  }
 }
 
 /** Map remote points (normalized 0–1 or raw px) → logical canvas pixels */
@@ -411,11 +460,18 @@ async function postStrokeServer(body: Record<string, unknown>) {
   }
 }
 
+function currentDrawSessionId(): string {
+  return drawingSessionId.value
+    || roomStore.currentRound?.id
+    || 'live'
+}
+
 function relayLiveSegment(slice: StrokePoint[]) {
   if (slice.length < 2 || !isDrawer.value) return
+  if (phase.value !== 'drawing') return
   const { w, h } = canvasSize()
   const norm = normalizePoints(slice)
-  const roundId = roomStore.currentRound?.id || 'live'
+  const roundId = currentDrawSessionId()
   const seq = liveSeq++
   const payload = {
     round_id: roundId,
@@ -427,8 +483,9 @@ function relayLiveSegment(slice: StrokePoint[]) {
     seq,
     canvas_w: w,
     canvas_h: h,
-    normalized: true,
+    normalized: true as const,
   }
+  // Fire-and-forget both paths for reliability
   void channel.sendLiveStroke(payload)
   void postStrokeServer({
     kind: 'live',
@@ -446,16 +503,19 @@ function relayLiveSegment(slice: StrokePoint[]) {
 async function relayCommitStrokes(batch: DrawingStroke[]) {
   if (!batch.length || !isDrawer.value) return
   const { w, h } = canvasSize()
-  // Normalize points for cross-device scale
+  const session = currentDrawSessionId()
+  // Normalize points for cross-device scale; force session round_id
   const normalized = batch.map(s => ({
     ...s,
+    round_id: session,
     points: normalizePoints(s.points),
+    shape_data: { ...(s.shape_data || {}), normalized: true, canvas_w: w, canvas_h: h },
   }))
   void channel.sendStrokes(normalized, { canvas_w: w, canvas_h: h, normalized: true })
   for (const s of normalized) {
     void postStrokeServer({
       kind: 'commit',
-      round_id: s.round_id,
+      round_id: session,
       tool: s.tool,
       color: s.color,
       size: s.size,
@@ -469,9 +529,10 @@ async function relayCommitStrokes(batch: DrawingStroke[]) {
 
 function startStrokePoll() {
   stopStrokePoll()
+  // Faster poll for smoother fallback when Realtime drops live frames
   strokePollTimer = setInterval(() => {
     void pollStrokes()
-  }, 280)
+  }, 160)
 }
 
 function stopStrokePoll() {
@@ -503,35 +564,29 @@ async function pollStrokes() {
       last_seq: number
     }>(`/api/rooms/strokes?room_id=${encodeURIComponent(room.value.id)}&after=${pollAfterSeq}`)
 
-    if (res.last_seq > pollAfterSeq) pollAfterSeq = res.last_seq
+    if (typeof res.last_seq === 'number' && res.last_seq > pollAfterSeq) {
+      pollAfterSeq = res.last_seq
+    }
     if (!res.strokes?.length) return
 
+    const batch: DrawingStroke[] = []
     for (const s of res.strokes) {
       // Skip own
       if (s.user_id && s.user_id === auth.user?.id) continue
 
       if (s.kind === 'clear') {
+        // Apply clear (drawer wiped board). After word pick, buffer is only [clear]+new strokes.
         game.wipeStrokes()
         seenLiveSeq.clear()
         seenCommitKey.clear()
         setupCanvas(true)
+        protectCanvas = true
         continue
       }
 
-      // Drop strokes from a previous round (stale buffer)
-      const active = activeRoundId.value
-      if (
-        active
-        && s.round_id
-        && s.round_id !== 'live'
-        && s.round_id !== active
-      ) {
-        continue
-      }
-
-      const asStroke: DrawingStroke = {
-        round_id: s.round_id || 'live',
-        sequence: s.kind === 'live' ? -(s.seq) : s.seq,
+      batch.push({
+        round_id: s.round_id || drawingSessionId.value || 'live',
+        sequence: s.kind === 'live' ? -(1000000 + s.seq) : s.seq,
         tool: (s.tool as DrawingStroke['tool']) || 'pen',
         color: s.color || '#000',
         size: s.size || 6,
@@ -545,9 +600,9 @@ async function pollStrokes() {
           canvas_h: s.canvas_h,
           normalized: true,
         },
-      }
-      handleRemoteStrokes([asStroke])
+      })
     }
+    if (batch.length) handleRemoteStrokes(batch)
   } catch {
     // silent — Realtime may still work
   }
@@ -558,25 +613,39 @@ function pick(w: WordChoice) {
     toast.error('Bukan giliranmu menggambar')
     return
   }
+  // Stable session id shared with guessers via word_selected
+  const sessionId = roomStore.currentRound?.id || crypto.randomUUID()
+  if (roomStore.currentRound) {
+    roomStore.currentRound.id = sessionId
+  }
+  drawingSessionId.value = sessionId
+
   // Wipe local + server buffer so previous round's art never stacks for guessers
   resetDrawingSurface({ broadcast: true })
   game.selectWord(w)
+  // Keep session id after selectWord (wipeStrokes doesn't touch round)
+  drawingSessionId.value = sessionId
+  if (roomStore.currentRound) roomStore.currentRound.id = sessionId
+
   channel.sendGame('word_selected', {
     word: w.text,
     drawerId: drawerId.value || auth.user?.id,
     drawTime: room.value?.draw_time ?? 60,
-    roundId: roomStore.currentRound?.id,
+    roundId: sessionId,
   })
+  protectCanvas = true
   toast.success(`Gambar: ${w.text}`)
+  // Single setup only — no delayed wipe that erases first strokes
   requestAnimationFrame(() => {
     setupCanvas(true)
-    setTimeout(() => setupCanvas(true), 50)
-    setTimeout(() => setupCanvas(true), 200)
+    protectCanvas = true
   })
 }
 
 watch(phase, async (p) => {
   if (p === 'selecting' || p === 'scoreboard' || p === 'winner') {
+    protectCanvas = false
+    drawingSessionId.value = ''
     // Leaving a draw turn — blank board so role swap never shows old ink
     resetDrawingSurface({ broadcast: false })
   }
@@ -586,11 +655,11 @@ watch(phase, async (p) => {
   }
   if (p === 'drawing') {
     play('countdown')
-    // Start of draw phase: blank first (drawer will paint; guesser waits for relay)
-    // Strokes store already wiped on selectWord / onRemoteWordSelected
+    // One canvas init only. Delayed re-setup was wiping live remote strokes.
     nextTick(() => {
-      setupCanvas(true)
-      setTimeout(() => setupCanvas(true), 100)
+      if (!ctx) setupCanvas(true)
+      else layoutCanvasCss()
+      protectCanvas = true
     })
   }
 })
@@ -623,6 +692,9 @@ function getDpr() {
 /**
  * Fixed logical resolution 800×500 (16:10).
  * CSS scales with correct aspect — never stretch on mobile.
+ * forceResize=true rebuilds bitmap (white + replay store).
+ * While protectCanvas && drawing, refuse accidental full wipes unless forceResize
+ * was requested from resetDrawingSurface (which clears protect first).
  */
 function setupCanvas(forceResize = true) {
   const c = canvasEl.value
@@ -631,7 +703,15 @@ function setupCanvas(forceResize = true) {
   const dpr = getDpr()
   const bufW = Math.round(LOGICAL_W * dpr)
   const bufH = Math.round(LOGICAL_H * dpr)
-  const needsInit = forceResize || !ctx || c.width !== bufW || c.height !== bufH
+  const sizeMismatch = c.width !== bufW || c.height !== bufH
+  // If protected mid-draw and canvas already valid, only refresh CSS layout
+  if (protectCanvas && phase.value === 'drawing' && ctx && !sizeMismatch && !forceResize) {
+    layoutCanvasCss()
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    return
+  }
+
+  const needsInit = forceResize || !ctx || sizeMismatch
 
   layoutCanvasCss()
   c.style.backgroundColor = '#ffffff'
@@ -664,7 +744,7 @@ function setupCanvas(forceResize = true) {
     for (const s of strokes.value) {
       if (s.points?.length >= 2) {
         const meta = (s.shape_data || {}) as { canvas_w?: number; canvas_h?: number; normalized?: boolean }
-        const local = toLocalPoints(s.points, meta)
+        const local = toLocalPoints(s.points, { ...meta, normalized: meta.normalized ?? true })
         paintSegmentRaw(local, s.color, s.size, !!(s.is_eraser || s.tool === 'eraser'))
       }
     }
@@ -828,7 +908,9 @@ function clearAll() {
   void postStrokeServer({ kind: 'clear' })
   seenLiveSeq.clear()
   seenCommitKey.clear()
+  protectCanvas = false
   setupCanvas(true)
+  protectCanvas = true
 }
 </script>
 

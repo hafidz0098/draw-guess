@@ -495,13 +495,18 @@ export const useGameStore = defineStore('game', () => {
     const drawTime = payload.drawTime ?? roomStore.room?.draw_time ?? 60
     startTimer(drawTime)
     startHintProgression(payload.word, drawTime)
+
+    // CRITICAL: sync round id with drawer so stroke relay is not filtered out
+    const rid = payload.roundId || roomStore.currentRound?.id || crypto.randomUUID()
     if (roomStore.currentRound) {
+      roomStore.currentRound.id = rid
       roomStore.currentRound.status = 'drawing'
       roomStore.currentRound.drawer_id = payload.drawerId
       roomStore.currentRound.word_text = payload.word
+      roomStore.currentRound.drawing_started_at = new Date().toISOString()
     } else if (roomStore.room) {
       roomStore.currentRound = {
-        id: payload.roundId || crypto.randomUUID(),
+        id: rid,
         session_id: roomStore.session?.id || '',
         room_id: roomStore.room.id,
         round_number: roundNumber.value || 1,
