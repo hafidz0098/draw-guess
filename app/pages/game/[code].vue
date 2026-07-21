@@ -23,10 +23,20 @@ const loading = ref(true)
 const statusMsg = ref('init')
 
 const canvasEl = ref<HTMLCanvasElement | null>(null)
+const canvasWrap = ref<HTMLElement | null>(null)
 const tool = ref<'pen' | 'brush' | 'marker' | 'eraser'>('pen')
 const ink = ref('#000000') // black ink on white canvas
 const brushSize = ref(8)
 const painting = ref(false)
+
+/**
+ * Fixed logical drawing surface — same aspect on phone & desktop.
+ * CSS only scales (letterbox); never stretch the bitmap.
+ * 16:10 landscape feels natural for draw & guess.
+ */
+const LOGICAL_W = 800
+const LOGICAL_H = 500
+const CANVAS_ASPECT = LOGICAL_W / LOGICAL_H
 
 let ctx: CanvasRenderingContext2D | null = null
 let last: StrokePoint | null = null
@@ -38,6 +48,7 @@ let liveSentIdx = 0
 /** Poll cursor for server stroke buffer */
 let pollAfterSeq = 0
 let strokePollTimer: ReturnType<typeof setInterval> | null = null
+let resizeObs: ResizeObserver | null = null
 /** Dedupe remote live paints by seq */
 const seenLiveSeq = new Set<number>()
 const seenCommitKey = new Set<string>()
@@ -129,6 +140,18 @@ onMounted(async () => {
 
     startStrokePoll()
 
+    // Keep CSS box correct on rotate / keyboard open (bitmap stays logical size)
+    if (import.meta.client && typeof ResizeObserver !== 'undefined') {
+      resizeObs = new ResizeObserver(() => {
+        layoutCanvasCss()
+      })
+      nextTick(() => {
+        if (canvasWrap.value) resizeObs?.observe(canvasWrap.value)
+        layoutCanvasCss()
+        setupCanvas(true)
+      })
+    }
+
     statusMsg.value = `${isDrawer.value ? 'DRAWER' : 'GUESSER'} · rt:${channel.channelStatus()}`
     toast.success(
       isDrawer.value ? 'Giliranmu menggambar — pilih kata!' : `${drawerName.value} memilih kata...`,
@@ -146,6 +169,8 @@ onUnmounted(() => {
   offGame?.()
   offBus?.()
   stopStrokePoll()
+  resizeObs?.disconnect()
+  resizeObs = null
   if (liveThrottle) clearTimeout(liveThrottle)
 })
 
@@ -259,44 +284,73 @@ function handleRemoteStrokes(remote: DrawingStroke[]) {
   statusMsg.value = `stroke in · rt:${channel.channelStatus()}`
 }
 
-/** Map remote points (normalized 0–1 or raw px) → local canvas pixels */
+/** Map remote points (normalized 0–1 or raw px) → logical canvas pixels */
 function toLocalPoints(
   points: StrokePoint[],
   meta: { canvas_w?: number; canvas_h?: number; normalized?: boolean },
 ): StrokePoint[] {
-  const c = canvasEl.value
-  const lw = c?.width || 800
-  const lh = c?.height || 400
-
   const looksNormalized = meta.normalized
     ?? points.every(p => p.x <= 1.5 && p.y <= 1.5 && p.x >= -0.1 && p.y >= -0.1)
 
   if (looksNormalized) {
-    return points.map(p => ({ x: p.x * lw, y: p.y * lh, ...(p.p !== undefined ? { p: p.p } : {}) }))
+    return points.map(p => ({
+      x: p.x * LOGICAL_W,
+      y: p.y * LOGICAL_H,
+      ...(p.p !== undefined ? { p: p.p } : {}),
+    }))
   }
 
-  // Scale from drawer canvas size if provided
-  const sw = meta.canvas_w || 800
-  const sh = meta.canvas_h || 400
+  // Legacy: scale from drawer canvas size into fixed logical space
+  const sw = meta.canvas_w || LOGICAL_W
+  const sh = meta.canvas_h || LOGICAL_H
   return points.map(p => ({
-    x: (p.x / sw) * lw,
-    y: (p.y / sh) * lh,
+    x: (p.x / sw) * LOGICAL_W,
+    y: (p.y / sh) * LOGICAL_H,
     ...(p.p !== undefined ? { p: p.p } : {}),
   }))
 }
 
 function canvasSize() {
-  const c = canvasEl.value
-  return { w: c?.width || 800, h: c?.height || 400 }
+  // Always report logical size so multiplayer aspect stays consistent
+  return { w: LOGICAL_W, h: LOGICAL_H }
 }
 
 function normalizePoints(points: StrokePoint[]): StrokePoint[] {
-  const { w, h } = canvasSize()
   return points.map(p => ({
-    x: p.x / Math.max(1, w),
-    y: p.y / Math.max(1, h),
+    x: p.x / LOGICAL_W,
+    y: p.y / LOGICAL_H,
     ...(p.p !== undefined ? { p: p.p } : {}),
   }))
+}
+
+/** Fit canvas CSS box into wrap without changing aspect (no stretch) */
+function layoutCanvasCss() {
+  const c = canvasEl.value
+  const wrap = canvasWrap.value
+  if (!c) return
+
+  let availW = wrap?.clientWidth || 0
+  if (availW < 40) {
+    availW = Math.max(280, Math.min(window.innerWidth - 24, 900))
+  }
+
+  // Cap height on short phones so canvas + chat still fit
+  const maxH = Math.min(
+    Math.floor(window.innerHeight * 0.42),
+    480,
+    Math.floor(availW / CANVAS_ASPECT),
+  )
+  let displayW = availW
+  let displayH = Math.round(displayW / CANVAS_ASPECT)
+  if (displayH > maxH) {
+    displayH = Math.max(180, maxH)
+    displayW = Math.round(displayH * CANVAS_ASPECT)
+  }
+
+  c.style.width = `${displayW}px`
+  c.style.height = `${displayH}px`
+  c.style.maxWidth = '100%'
+  c.style.aspectRatio = `${LOGICAL_W} / ${LOGICAL_H}`
 }
 
 async function postStrokeServer(body: Record<string, unknown>) {
@@ -478,48 +532,52 @@ watch(phase, (p) => {
   }
 })
 
+function getDpr() {
+  if (!import.meta.client) return 1
+  return Math.min(window.devicePixelRatio || 1, 2.5)
+}
+
 /**
- * Setup white canvas.
- * forceResize=true resets bitmap (clear + replay strokes).
- * forceResize=false only acquires ctx if missing — does NOT wipe drawing.
+ * Fixed logical resolution 800×500 (16:10).
+ * CSS scales with correct aspect — never stretch on mobile.
  */
 function setupCanvas(forceResize = true) {
   const c = canvasEl.value
   if (!c) return
 
-  const box = c.parentElement
-  // Prefer visible parent width; fall back to window when v-show still 0
-  let w = Math.floor(box?.clientWidth || 0)
-  if (w < 50) w = Math.max(300, Math.floor(window.innerWidth - 48))
-  const h = 400
+  const dpr = getDpr()
+  const bufW = Math.round(LOGICAL_W * dpr)
+  const bufH = Math.round(LOGICAL_H * dpr)
+  const needsInit = forceResize || !ctx || c.width !== bufW || c.height !== bufH
 
-  const needsResize = forceResize || c.width !== w || c.height !== h || !ctx
-
-  if (needsResize) {
-    // Setting width/height resets the bitmap
-    c.width = w
-    c.height = h
-  }
-  c.style.width = '100%'
-  c.style.height = `${h}px`
+  layoutCanvasCss()
   c.style.backgroundColor = '#ffffff'
   c.style.display = 'block'
+  c.style.touchAction = 'none'
+  c.style.objectFit = 'contain'
+
+  if (needsInit) {
+    // Setting width/height resets the bitmap
+    c.width = bufW
+    c.height = bufH
+  }
 
   // Do NOT use { alpha: false } — causes black canvas in some browsers
   ctx = c.getContext('2d')
   if (!ctx) return
 
-  if (needsResize) {
-    ctx.setTransform(1, 0, 0, 1, 0, 0)
+  // Draw in logical coordinates; DPR scales the buffer for retina
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+  if (needsInit) {
     ctx.globalCompositeOperation = 'source-over'
     ctx.globalAlpha = 1
     ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, w, h)
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H)
     ctx.lineCap = 'round'
     ctx.lineJoin = 'round'
-    statusMsg.value = `canvas ${w}x${h} · rt:${channel.channelStatus()}`
+    statusMsg.value = `canvas ${LOGICAL_W}×${LOGICAL_H} · rt:${channel.channelStatus()}`
 
-    // Replay committed strokes (may be normalized or local px)
     for (const s of strokes.value) {
       if (s.points?.length >= 2) {
         const meta = (s.shape_data || {}) as { canvas_w?: number; canvas_h?: number; normalized?: boolean }
@@ -532,13 +590,19 @@ function setupCanvas(forceResize = true) {
 
 /** Get ctx without wiping existing drawing */
 function ensureCtxReady() {
-  if (ctx && canvasEl.value && canvasEl.value.width > 0) return true
+  if (ctx && canvasEl.value && canvasEl.value.width > 0) {
+    const dpr = getDpr()
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    return true
+  }
   setupCanvas(true)
   return !!ctx
 }
 
 function paintSegmentRaw(points: StrokePoint[], col: string, sz: number, erase: boolean) {
   if (!ctx || points.length < 1) return
+  const dpr = getDpr()
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   ctx.save()
   if (erase) {
     ctx.globalCompositeOperation = 'destination-out'
@@ -565,17 +629,22 @@ function paintSegment(points: StrokePoint[], col: string, sz: number, erase: boo
   paintSegmentRaw(points, col, sz, erase)
 }
 
+/** Map pointer → logical canvas coords (aspect-correct, no stretch) */
 function pos(e: PointerEvent): StrokePoint {
   const c = canvasEl.value!
   const r = c.getBoundingClientRect()
+  const rw = Math.max(1, r.width)
+  const rh = Math.max(1, r.height)
   return {
-    x: (e.clientX - r.left) * (c.width / Math.max(1, r.width)),
-    y: (e.clientY - r.top) * (c.height / Math.max(1, r.height)),
+    x: ((e.clientX - r.left) / rw) * LOGICAL_W,
+    y: ((e.clientY - r.top) / rh) * LOGICAL_H,
   }
 }
 
 function styleLocal() {
   if (!ctx) return
+  const dpr = getDpr()
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   if (tool.value === 'eraser') {
     ctx.globalCompositeOperation = 'destination-out'
     ctx.lineWidth = brushSize.value * 3
@@ -801,21 +870,18 @@ function clearAll() {
         </span>
       </div>
 
-      <!-- WHITE CANVAS -->
+      <!-- WHITE CANVAS — fixed 16:10 logical aspect, CSS scales without stretch -->
       <div
-        style="width:100%;height:420px;background:#ffffff !important;border:8px solid #f97316;border-radius:16px;overflow:hidden;"
+        ref="canvasWrap"
+        class="game-canvas-wrap"
       >
         <canvas
           ref="canvasEl"
           width="800"
-          height="400"
+          height="500"
+          class="game-canvas"
           :style="{
-            width: '100%',
-            height: '420px',
-            display: 'block',
-            backgroundColor: '#ffffff',
             cursor: canDraw ? 'crosshair' : 'default',
-            touchAction: 'none',
           }"
           @pointerdown="down"
           @pointermove="move"

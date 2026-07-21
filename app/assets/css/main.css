@@ -20,6 +20,43 @@
 }
 
 @layer components {
+  /* Draw & Guess canvas: fixed 16:10 logical aspect; JS sets CSS size (no stretch) */
+  .game-canvas-wrap {
+    width: 100%;
+    max-width: 900px;
+    margin-left: auto;
+    margin-right: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #ffffff !important;
+    border: 8px solid #f97316;
+    border-radius: 16px;
+    overflow: hidden;
+    box-sizing: border-box;
+    /* Height follows canvas child — do NOT force a different aspect here */
+    line-height: 0;
+  }
+
+  .game-canvas {
+    display: block;
+    background-color: #ffffff;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    /* Exact width/height set in JS with correct 16:10 ratio */
+    max-width: 100%;
+    height: auto;
+    object-fit: contain;
+  }
+
+  @media (max-width: 640px) {
+    .game-canvas-wrap {
+      border-width: 5px;
+      border-radius: 12px;
+    }
+  }
+
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-xl font-bold
       transition-all duration-200 ease-out
