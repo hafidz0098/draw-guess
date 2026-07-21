@@ -24,11 +24,10 @@ export const useRoomStore = defineStore('room', () => {
 
   const auth = useAuthStore()
 
+  /** Strict: only rooms.host_id is host (never trust role alone) */
   const isHost = computed(() => {
-    if (!room.value || !auth.user?.id) return false
-    if (room.value.host_id === auth.user.id) return true
-    const me = members.value.find(m => m.user_id === auth.user?.id)
-    return me?.role === 'host'
+    if (!room.value?.host_id || !auth.user?.id) return false
+    return room.value.host_id === auth.user.id
   })
 
   const myMember = computed(() => members.value.find(m => m.user_id === auth.user?.id))
@@ -40,9 +39,19 @@ export const useRoomStore = defineStore('room', () => {
     activeMembers.value.filter(m => m.role !== 'spectator'),
   )
 
-  const allReady = computed(() =>
-    connectedPlayers.value.length >= 2
-    && connectedPlayers.value.every(m => m.is_ready || m.role === 'host'),
+  function isRoomHostMember(m: RoomMember): boolean {
+    return !!room.value?.host_id && m.user_id === room.value.host_id
+  }
+
+  /** Min 2 players; host counts ready; every other connected player must is_ready */
+  const allReady = computed(() => {
+    const players = connectedPlayers.value
+    if (players.length < 2) return false
+    return players.every(m => isRoomHostMember(m) || !!m.is_ready)
+  })
+
+  const notReadyCount = computed(() =>
+    connectedPlayers.value.filter(m => !isRoomHostMember(m) && !m.is_ready).length,
   )
 
   const sortedByScore = computed(() =>
@@ -266,13 +275,33 @@ export const useRoomStore = defineStore('room', () => {
 
   async function toggleReady() {
     if (!myMember.value || !room.value) return
+    // Host is always ready — no toggle
+    if (isHost.value) return
+
     const next = !myMember.value.is_ready
+    // Optimistic UI
     myMember.value.is_ready = next
-    const client = useSupabase()
-    if (client) {
-      await client.from('room_members').update({ is_ready: next }).eq('id', myMember.value.id)
+
+    try {
+      const token = await auth.getAccessToken()
+      if (token && auth.hasSupabaseSession) {
+        await $fetch('/api/rooms/ready', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: { room_id: room.value.id, is_ready: next },
+        })
+      } else {
+        const client = useSupabase()
+        if (client) {
+          await client.from('room_members').update({ is_ready: next }).eq('id', myMember.value.id)
+        }
+      }
+    } catch (e) {
+      // Revert optimistic update
+      myMember.value.is_ready = !next
+      console.warn('[room] toggleReady failed', e)
+      throw e
     }
-    // Also via service path refresh
     await refreshLobbyState()
   }
 
@@ -416,75 +445,42 @@ export const useRoomStore = defineStore('room', () => {
 
     await refreshLobbyState()
 
-    // Soft host check: still try server (server is source of truth)
+    // Strict host only — no role fallback, no local solo start
+    if (!auth.user?.id || room.value.host_id !== auth.user.id) {
+      throw new Error('Hanya host yang bisa start game.')
+    }
+
+    if (connectedPlayers.value.length < 2) {
+      throw new Error('Minimal 2 pemain untuk mulai game.')
+    }
+
+    if (!allReady.value) {
+      throw new Error(
+        `Masih ada ${notReadyCount.value} pemain yang belum Ready. Tunggu semua ready dulu.`,
+      )
+    }
+
     const token = await auth.getAccessToken()
     if (!token || !auth.hasSupabaseSession) {
-      // Local solo start (no supabase session)
-      session.value = {
-        id: crypto.randomUUID(),
-        room_id: room.value.id,
-        status: 'active',
-        started_at: new Date().toISOString(),
-        ended_at: null,
-        winner_id: null,
-        total_rounds: room.value.total_rounds,
-      }
-      room.value = { ...room.value, status: 'playing', current_round: 1 }
-      members.value = members.value.map(m => ({ ...m, score: 0 }))
-      persistLocal()
-      return session.value
+      throw new Error('Session hilang. Refresh & login ulang.')
     }
 
-    try {
-      const res = await $fetch<{
-        room: Room
-        session: GameSession
-        members: RoomMember[]
-      }>('/api/rooms/start', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: { room_id: room.value.id },
-      })
+    // Server re-validates host + ready — never force-start on client
+    const res = await $fetch<{
+      room: Room
+      session: GameSession
+      members: RoomMember[]
+    }>('/api/rooms/start', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: { room_id: room.value.id },
+    })
 
-      room.value = res.room
-      session.value = res.session
-      members.value = normalizeMembers(res.members || []).map(m => ({ ...m, score: 0 }))
-      persistLocal()
-      return res.session
-    } catch (e: unknown) {
-      const msg = (e as { data?: { message?: string } })?.data?.message
-        || (e instanceof Error ? e.message : 'Gagal start di server')
-
-      // Fallback: start locally so game UI still opens
-      console.warn('[room] startGame server failed, local fallback:', msg)
-      session.value = {
-        id: crypto.randomUUID(),
-        room_id: room.value.id,
-        status: 'active',
-        started_at: new Date().toISOString(),
-        ended_at: null,
-        winner_id: null,
-        total_rounds: room.value.total_rounds,
-      }
-      room.value = { ...room.value, status: 'playing', current_round: 1 }
-      members.value = members.value.map(m => ({ ...m, score: 0 }))
-      if (!members.value.length && auth.user && auth.profile) {
-        members.value = [{
-          id: crypto.randomUUID(),
-          room_id: room.value.id,
-          user_id: auth.user.id,
-          role: 'host',
-          is_ready: true,
-          is_connected: true,
-          score: 0,
-          ping: 0,
-          joined_at: new Date().toISOString(),
-          profile: auth.profile,
-        }]
-      }
-      persistLocal()
-      return session.value
-    }
+    room.value = res.room
+    session.value = res.session
+    members.value = normalizeMembers(res.members || []).map(m => ({ ...m, score: 0 }))
+    persistLocal()
+    return res.session
   }
 
   function persistLocal() {
@@ -515,6 +511,7 @@ export const useRoomStore = defineStore('room', () => {
     activeMembers,
     connectedPlayers,
     allReady,
+    notReadyCount,
     sortedByScore,
     reset,
     createRoom,

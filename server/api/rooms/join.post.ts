@@ -82,7 +82,7 @@ export default defineEventHandler(async (event) => {
   // Count other connected players (exclude self for re-join)
   const { data: existingMembers } = await admin
     .from('room_members')
-    .select('user_id, is_connected, role')
+    .select('user_id, is_connected, role, is_ready')
     .eq('room_id', room.id)
 
   const othersConnected = (existingMembers || []).filter(
@@ -90,24 +90,30 @@ export default defineEventHandler(async (event) => {
   ).length
 
   const alreadyIn = (existingMembers || []).find(m => m.user_id === userId)
+  // Strict: only room.host_id is host — never keep stale role:host
   const role = room.host_id === userId
     ? 'host'
-    : (alreadyIn?.role === 'host'
-        ? 'host'
-        : (othersConnected >= room.max_players && !alreadyIn ? 'spectator' : 'player'))
+    : (othersConnected >= room.max_players && !alreadyIn ? 'spectator' : 'player')
+
+  // Host always ready; joining player starts not-ready (rejoin preserves ready only if waiting)
+  const isReady = role === 'host'
+    ? true
+    : (room.status === 'waiting' && alreadyIn
+        ? !!(alreadyIn as { is_ready?: boolean }).is_ready
+        : false)
 
   const { error: memErr } = await admin.from('room_members').upsert({
     room_id: room.id,
     user_id: userId,
     role,
-    is_ready: role === 'host' ? true : (alreadyIn as { is_ready?: boolean } | undefined)?.is_ready ?? false,
+    is_ready: isReady,
     is_connected: true,
     left_at: null,
   }, { onConflict: 'room_id,user_id' })
 
   await admin
     .from('room_members')
-    .update({ is_connected: true, left_at: null, role })
+    .update({ is_connected: true, left_at: null, role, is_ready: isReady })
     .eq('room_id', room.id)
     .eq('user_id', userId)
 

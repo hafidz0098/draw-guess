@@ -15,30 +15,44 @@ const { play } = useSound()
 const {
   room,
   messages,
-  isHost,
   connectedPlayers,
   myMember,
   syncError,
   loading,
+  allReady,
+  notReadyCount,
 } = storeToRefs(roomStore)
 
 const code = computed(() => String(route.params.code || '').toUpperCase())
 const chatInput = ref('')
 const starting = ref(false)
 const startError = ref('')
-const startLog = ref('')
 const booting = ref(true)
 
 const playerCount = computed(() => connectedPlayers.value.length)
 
-// Host if room says so OR membership role is host
-const canStartAsHost = computed(() => {
-  if (isHost.value) return true
-  if (myMember.value?.role === 'host') return true
-  if (room.value?.host_id && auth.user?.id && room.value.host_id === auth.user.id) return true
-  // Fallback: first connected member can start
-  const first = connectedPlayers.value[0]
-  return !!(first && first.user_id === auth.user?.id)
+/** Strict: only rooms.host_id — never role fallback / first-member fallback */
+const iAmHost = computed(() => {
+  if (!auth.user?.id || !room.value?.host_id) return false
+  return room.value.host_id === auth.user.id
+})
+
+const canStart = computed(() =>
+  iAmHost.value
+  && playerCount.value >= 2
+  && allReady.value
+  && room.value?.status === 'waiting'
+  && !starting.value,
+)
+
+const readySummary = computed(() => {
+  const total = playerCount.value
+  const hostId = room.value?.host_id
+  const ready = connectedPlayers.value.filter((m) => {
+    if (hostId && m.user_id === hostId) return true
+    return !!m.is_ready
+  }).length
+  return `${ready}/${total} ready`
 })
 
 useRoomRealtime(computed(() => room.value?.id))
@@ -74,7 +88,6 @@ onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
 })
 
-// When room becomes playing (from any source), go to game
 watch(
   () => room.value?.status,
   (status) => {
@@ -90,8 +103,6 @@ function goToGame(roomCode: string) {
     pollTimer = null
   }
   const path = `/game/${roomCode}`
-  startLog.value = `Navigasi ke ${path}...`
-  // Hard navigation — most reliable
   if (import.meta.client) {
     window.location.assign(path)
   } else {
@@ -115,65 +126,65 @@ async function copyInvite() {
 
 async function refresh() {
   await roomStore.refreshLobbyState()
-  toast.message(`Pemain: ${playerCount.value}`)
+  toast.message(`Pemain: ${playerCount.value} · ${readySummary.value}`)
 }
 
-/**
- * START GAME — always forces navigation to /game/:code
- */
+async function onToggleReady() {
+  if (iAmHost.value) {
+    toast.message('Host otomatis ready')
+    return
+  }
+  try {
+    await roomStore.toggleReady()
+    toast.success(myMember.value?.is_ready ? 'Kamu Ready!' : 'Ready dibatalkan')
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : 'Gagal update Ready')
+  }
+}
+
 async function start() {
   if (starting.value) return
-  starting.value = true
   startError.value = ''
-  startLog.value = '1. Start diklik...'
 
-  const roomCode = room.value?.code || code.value
-  if (!roomCode) {
-    startError.value = 'Kode room hilang'
-    starting.value = false
+  // Hard gate: non-host never starts
+  if (!iAmHost.value) {
+    toast.error('Hanya host yang bisa start game')
     return
   }
 
+  await roomStore.refreshLobbyState()
+
+  if (playerCount.value < 2) {
+    toast.error('Minimal 2 pemain untuk mulai')
+    return
+  }
+
+  if (!allReady.value) {
+    toast.error(`Masih ada ${notReadyCount.value} pemain belum Ready`)
+    return
+  }
+
+  if (!canStart.value) {
+    toast.error('Belum bisa start — cek jumlah pemain & status Ready')
+    return
+  }
+
+  starting.value = true
   try {
-    startLog.value = '2. Sync lobby...'
-    await roomStore.refreshLobbyState()
-
-    startLog.value = '3. Reset game state...'
     game.reset()
-
-    startLog.value = '4. Memanggil startGame()...'
     await roomStore.startGame()
-
-    // Ensure local status is playing even if server lag
-    if (roomStore.room) {
-      roomStore.room.status = 'playing'
-    }
-
-    startLog.value = '5. Sukses — pindah ke game...'
     toast.success('Game dimulai!')
-
-    // Small delay so pinia state flushes
     await nextTick()
-    goToGame(roomCode)
+    goToGame(room.value!.code)
   } catch (e: unknown) {
     console.error('[lobby] start error', e)
     const msg = (e as { data?: { message?: string } })?.data?.message
       || (e instanceof Error ? e.message : 'Gagal start')
     startError.value = msg
-    startLog.value = `Error: ${msg} — tetap coba buka game...`
     toast.error(msg)
-
-    // FORCE open game page anyway
-    if (roomStore.room) {
-      roomStore.room.status = 'playing'
-    }
-    await nextTick()
-    goToGame(roomCode)
+    // Stay in lobby on failure — never force navigate
   } finally {
-    // If hard nav works, this page unloads; otherwise unlock button
-    setTimeout(() => {
-      starting.value = false
-    }, 3000)
+    starting.value = false
   }
 }
 
@@ -206,11 +217,11 @@ async function sendLobbyChat() {
                 {{ room.total_rounds }} ronde · {{ room.draw_time }}s · {{ room.language?.toUpperCase() }}
               </p>
               <p class="mt-2 text-base font-black text-orange-500">
-                {{ playerCount }} / {{ room.max_players }} pemain
+                {{ playerCount }} / {{ room.max_players }} pemain · {{ readySummary }}
               </p>
               <p v-if="syncError" class="mt-1 text-xs font-bold text-red-400">Sync: {{ syncError }}</p>
               <p class="mt-1 text-xs text-slate-500">
-                Status: {{ room.status }} · {{ canStartAsHost ? 'Bisa start' : 'Bukan host' }}
+                Kamu: <b class="text-white">{{ iAmHost ? 'HOST' : 'PLAYER' }}</b>
               </p>
             </div>
             <div class="flex flex-wrap gap-2">
@@ -243,34 +254,42 @@ async function sendLobbyChat() {
                 {{ m.profile?.nickname || m.user_id?.slice(0, 6) }}
               </p>
               <span
-                v-if="m.role === 'host'"
+                v-if="m.user_id === room.host_id"
                 class="rounded bg-orange-500/20 px-2 text-[10px] font-bold text-orange-300"
               >HOST</span>
               <span
                 v-else-if="m.is_ready"
                 class="rounded bg-emerald-500/20 px-2 text-[10px] font-bold text-emerald-300"
-              >READY</span>
+              >READY ✓</span>
+              <span
+                v-else
+                class="rounded bg-slate-700 px-2 text-[10px] font-bold text-slate-400"
+              >NOT READY</span>
             </div>
           </div>
 
           <!-- Actions -->
           <div class="mt-6 flex flex-col gap-3">
             <div class="flex flex-wrap gap-2">
+              <!-- Non-host: Ready only -->
               <button
-                v-if="!canStartAsHost"
+                v-if="!iAmHost"
                 type="button"
-                class="btn btn-primary"
-                @click="roomStore.toggleReady()"
+                class="inline-flex items-center justify-center gap-2 rounded-xl px-6 py-3 text-base font-black text-white shadow-card transition active:scale-[0.97]"
+                :class="myMember?.is_ready ? 'bg-slate-600 hover:bg-slate-500' : 'bg-emerald-500 hover:bg-emerald-600'"
+                @click="onToggleReady"
               >
-                {{ myMember?.is_ready ? 'Cancel Ready' : 'Ready!' }}
+                {{ myMember?.is_ready ? 'Cancel Ready' : '✓ Ready!' }}
               </button>
 
-              <!-- Native button — no component click fallthrough issues -->
+              <!-- Host only: Start Game (hidden for non-host) -->
               <button
+                v-if="iAmHost"
                 type="button"
-                class="inline-flex items-center justify-center gap-2 rounded-xl bg-orange-500 px-6 py-3 text-base font-black text-white shadow-card transition hover:bg-orange-600 active:scale-[0.97] disabled:opacity-50"
-                :disabled="starting"
-                @click="start"
+                class="inline-flex items-center justify-center gap-2 rounded-xl bg-orange-500 px-6 py-3 text-base font-black text-white shadow-card transition hover:bg-orange-600 active:scale-[0.97] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-40"
+                :disabled="!canStart"
+                :title="canStart ? 'Mulai game' : 'Semua pemain non-host harus Ready dulu'"
+                @click.prevent="start"
               >
                 <span
                   v-if="starting"
@@ -279,27 +298,42 @@ async function sendLobbyChat() {
                 {{ starting ? 'Memulai...' : '▶ START GAME' }}
               </button>
 
-              <button
-                type="button"
-                class="btn btn-ghost"
-                @click="leave"
-              >
+              <button type="button" class="btn btn-ghost" @click="leave">
                 Leave
               </button>
             </div>
 
-            <!-- Live feedback so user always sees something -->
+            <!-- Status hints -->
             <div
-              v-if="startLog || startError"
-              class="rounded-xl border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
+              v-if="iAmHost"
+              class="rounded-xl border px-3 py-2 text-sm font-bold"
+              :class="canStart
+                ? 'border-emerald-600/50 bg-emerald-500/10 text-emerald-300'
+                : 'border-amber-600/50 bg-amber-500/10 text-amber-200'"
             >
-              <p v-if="startLog" class="font-bold text-orange-300">{{ startLog }}</p>
-              <p v-if="startError" class="mt-1 font-bold text-red-400">{{ startError }}</p>
+              <template v-if="playerCount < 2">
+                Tunggu minimal 1 pemain lagi join (kode {{ room.code }})
+              </template>
+              <template v-else-if="!allReady">
+                Menunggu {{ notReadyCount }} pemain Ready... ({{ readySummary }})
+              </template>
+              <template v-else>
+                Semua ready ({{ readySummary }}) — klik Start Game!
+              </template>
+            </div>
+            <div
+              v-else
+              class="rounded-xl border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-300"
+            >
+              <template v-if="myMember?.is_ready">
+                Kamu sudah Ready. Menunggu host memulai...
+              </template>
+              <template v-else>
+                Tekan <b class="text-emerald-400">Ready!</b> agar host bisa start.
+              </template>
             </div>
 
-            <p class="text-sm text-slate-400">
-              Setelah Start, browser akan pindah ke halaman game otomatis.
-            </p>
+            <p v-if="startError" class="text-sm font-bold text-red-400">{{ startError }}</p>
           </div>
         </div>
       </div>

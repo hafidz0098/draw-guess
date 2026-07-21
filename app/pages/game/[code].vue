@@ -77,9 +77,11 @@ onMounted(async () => {
     }
     await roomStore.refreshLobbyState()
 
+    // Do NOT auto-start from game page — only host may start from lobby after all ready
     if (room.value && room.value.status !== 'playing') {
-      try { await roomStore.startGame() }
-      catch { if (room.value) room.value.status = 'playing' }
+      toast.error('Game belum dimulai. Tunggu host start dari lobby.')
+      await navigateTo(`/lobby/${code.value}`)
+      return
     }
 
     // Wire realtime handlers

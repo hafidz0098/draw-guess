@@ -60,22 +60,18 @@ export default defineEventHandler(async (event) => {
     .eq('user_id', userId)
     .maybeSingle()
 
-  const isHost = room.host_id === userId || myMembership?.role === 'host'
-  if (!isHost) {
+  // Strict host check: only room.host_id may start
+  if (room.host_id !== userId) {
     throw createError({
       statusCode: 403,
-      message: 'Hanya host yang bisa start.',
+      message: 'Hanya host yang bisa start game.',
     })
   }
 
-  if (room.host_id !== userId) {
-    await admin.from('rooms').update({ host_id: userId }).eq('id', roomId)
-  }
-
-  // Mark caller connected
+  // Mark host connected + ready
   await admin
     .from('room_members')
-    .update({ is_connected: true, left_at: null })
+    .update({ is_connected: true, left_at: null, is_ready: true, role: 'host' })
     .eq('room_id', roomId)
     .eq('user_id', userId)
 
@@ -89,11 +85,26 @@ export default defineEventHandler(async (event) => {
     m => m.role !== 'spectator' && m.is_connected !== false,
   )
 
-  // Allow 1 player (solo practice) — multiplayer works with 2+
-  if (players.length < 1) {
+  if (players.length < 2) {
     throw createError({
       statusCode: 400,
-      message: 'Tidak ada pemain di room. Join ulang.',
+      message: 'Minimal 2 pemain untuk mulai game.',
+    })
+  }
+
+  // All non-host players must be ready (strict: only host_id is exempt)
+  const notReady = players.filter(
+    m => m.user_id !== room.host_id && !m.is_ready,
+  )
+  if (notReady.length > 0) {
+    const names = notReady
+      .map((m: { profile?: { nickname?: string }; user_id: string }) =>
+        m.profile?.nickname || m.user_id.slice(0, 6),
+      )
+      .join(', ')
+    throw createError({
+      statusCode: 400,
+      message: `Masih ada ${notReady.length} pemain yang belum Ready${names ? `: ${names}` : ''}.`,
     })
   }
 
