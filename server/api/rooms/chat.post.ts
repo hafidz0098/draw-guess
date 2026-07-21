@@ -51,12 +51,16 @@ export default defineEventHandler(async (event) => {
     .eq('id', userId)
     .maybeSingle()
 
-  const row = {
+  const row: Record<string, unknown> = {
     room_id: parsed.data.room_id,
     user_id: userId,
     message: parsed.data.message.slice(0, 200),
     message_type: parsed.data.message_type,
     is_hidden: parsed.data.message_type === 'correct',
+  }
+  // Prefer client id so local + poll share one id (prevents duplicate bubbles)
+  if (parsed.data.client_id) {
+    row.id = parsed.data.client_id
   }
 
   const { data: inserted, error } = await admin

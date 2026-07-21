@@ -345,13 +345,53 @@ export const useRoomStore = defineStore('room', () => {
     await refreshLobbyState()
   }
 
+  function resolveProfile(
+    userId: string,
+    profileRaw?: ChatMessage['profile'] | null,
+  ): ChatMessage['profile'] {
+    const nick = profileRaw?.nickname?.trim()
+    if (nick) {
+      return {
+        id: profileRaw!.id || userId,
+        nickname: nick,
+        avatar_url: profileRaw!.avatar_url ?? null,
+        level: profileRaw!.level ?? 1,
+      }
+    }
+    // Enrich from room members / self
+    const member = members.value.find(m => m.user_id === userId)
+    if (member?.profile?.nickname) {
+      return {
+        id: member.profile.id || userId,
+        nickname: member.profile.nickname,
+        avatar_url: member.profile.avatar_url ?? null,
+        level: member.profile.level ?? 1,
+      }
+    }
+    if (auth.user?.id === userId && auth.profile?.nickname) {
+      return {
+        id: auth.profile.id,
+        nickname: auth.profile.nickname,
+        avatar_url: auth.profile.avatar_url ?? null,
+        level: auth.profile.level ?? 1,
+      }
+    }
+    return {
+      id: userId,
+      nickname: userId ? `Player_${userId.slice(0, 4)}` : 'Player',
+      avatar_url: null,
+      level: 1,
+    }
+  }
+
   async function sendChat(
     message: string,
     messageType: ChatMessage['message_type'] = 'chat',
   ): Promise<ChatMessage | null> {
     if (!room.value || !auth.user || !auth.profile) return null
+    const clientId = crypto.randomUUID()
     const msg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: clientId,
       room_id: room.value.id,
       user_id: auth.user.id,
       round_id: currentRound.value?.id ?? null,
@@ -369,55 +409,96 @@ export const useRoomStore = defineStore('room', () => {
     }
     messages.value.push(msg)
 
-    // Best-effort DB persist (may fail RLS — realtime broadcast is primary sync)
-    const client = useSupabase()
-    if (client) {
-      try {
-        await client.from('chat_messages').insert({
-          room_id: msg.room_id,
-          user_id: msg.user_id,
-          round_id: msg.round_id,
-          message: msg.message,
-          message_type: msg.message_type,
-          is_hidden: msg.is_hidden,
+    // Persist via server API (service role) — avoids RLS + returns profile
+    // Do NOT also insert via client (would create a 2nd row → duplicate ": msg")
+    try {
+      const token = await auth.getAccessToken()
+      if (token && auth.hasSupabaseSession) {
+        const res = await $fetch<{ message: ChatMessage; persisted?: boolean }>('/api/rooms/chat', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: {
+            room_id: room.value.id,
+            message,
+            message_type: messageType,
+            client_id: clientId,
+          },
         })
-      } catch { /* ignore */ }
+        if (res.message?.id) {
+          // Align local id with server so poll/realtime/postgres dedupe works
+          const idx = messages.value.findIndex(m => m.id === clientId)
+          if (idx >= 0) {
+            messages.value[idx] = {
+              ...messages.value[idx],
+              id: res.message.id,
+              created_at: res.message.created_at || messages.value[idx].created_at,
+              profile: resolveProfile(auth.user.id, res.message.profile || msg.profile),
+            }
+            return messages.value[idx]
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[room] sendChat server failed', e)
     }
-    return msg
+    return (
+      messages.value.find(m => m.id === clientId)
+      || messages.value.find(m => m.user_id === auth.user?.id && m.message === message)
+      || msg
+    )
   }
 
-  /** Apply chat message from another client (realtime or poll) */
+  /**
+   * Apply chat message from another client (realtime / poll / postgres).
+   * Dedupes by id AND by (user + text + ~8s window) to stop triple echoes.
+   */
   function pushRemoteMessage(raw: Record<string, unknown>) {
-    const id = String(raw.id || '')
-    if (!id) return
-    if (messages.value.some(m => m.id === id)) return
+    let id = String(raw.id || '')
+    const message = String(raw.message || '').trim()
+    const userId = String(raw.user_id || '')
+    const created = String(raw.created_at || '')
+    if (!message) return
+
+    // Synthetic id if missing (shouldn't happen often)
+    if (!id) {
+      id = `syn-${userId}-${message}-${created || Date.now()}`
+    }
+
+    if (messages.value.some(m => m.id === id)) {
+      // Upgrade nickname if we already have a shell without profile
+      const existing = messages.value.find(m => m.id === id)
+      if (existing && !existing.profile?.nickname?.trim()) {
+        existing.profile = resolveProfile(userId, raw.profile as ChatMessage['profile'])
+      }
+      return
+    }
 
     const msgRoomId = String(raw.room_id || '')
-    // Ignore messages that don't belong to current room
     if (room.value?.id && msgRoomId && msgRoomId !== room.value.id) {
       return
     }
-    if (room.value?.id && !msgRoomId) {
-      // allow if no room_id on payload (legacy), will tag with current room
-    }
 
-    // Also dedupe by same user+message+second (poll vs broadcast)
-    const message = String(raw.message || '')
-    const userId = String(raw.user_id || '')
-    const created = String(raw.created_at || '')
-    if (
-      message
-      && userId
-      && messages.value.some(
-        m => m.user_id === userId
-          && m.message === message
-          && Math.abs(new Date(m.created_at).getTime() - new Date(created || Date.now()).getTime()) < 3000,
-      )
-    ) {
+    // Content dedupe: same user + same text within 8s (broadcast + poll + postgres)
+    const createdMs = created ? new Date(created).getTime() : Date.now()
+    const dup = messages.value.find((m) => {
+      if (m.user_id !== userId || m.message !== message) return false
+      const t = new Date(m.created_at).getTime()
+      return Math.abs(t - createdMs) < 8000
+    })
+    if (dup) {
+      // Prefer richer profile / stable server id
+      if (!dup.profile?.nickname?.trim()) {
+        dup.profile = resolveProfile(userId, raw.profile as ChatMessage['profile'])
+      }
+      // If local client id and server id differ, keep one — adopt server id
+      if (id && dup.id !== id && !dup.id.startsWith('syn-')) {
+        // keep existing
+      } else if (id && dup.id !== id) {
+        dup.id = id
+      }
       return
     }
 
-    const profileRaw = raw.profile as ChatMessage['profile'] | undefined
     const msg: ChatMessage = {
       id,
       room_id: msgRoomId || room.value?.id || '',
@@ -428,16 +509,15 @@ export const useRoomStore = defineStore('room', () => {
       is_hidden: !!raw.is_hidden,
       mentions: (raw.mentions as string[]) || [],
       created_at: created || new Date().toISOString(),
-      profile: profileRaw || {
-        id: userId,
-        nickname: 'Player',
-        avatar_url: null,
-        level: 1,
-      },
+      profile: resolveProfile(userId, raw.profile as ChatMessage['profile']),
     }
-    // Final guard
     if (room.value?.id && msg.room_id && msg.room_id !== room.value.id) return
     messages.value = [...messages.value, msg]
+  }
+
+  /** Display nickname helper for UI */
+  function chatNickname(m: ChatMessage): string {
+    return resolveProfile(m.user_id, m.profile).nickname
   }
 
   async function startGame() {
@@ -525,6 +605,7 @@ export const useRoomStore = defineStore('room', () => {
     transferHost,
     sendChat,
     pushRemoteMessage,
+    chatNickname,
     startGame,
     persistLocal,
   }

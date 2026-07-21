@@ -41,10 +41,12 @@ export function useRoomRealtime(roomId: Ref<string | null | undefined>) {
         table: 'chat_messages',
         filter: `room_id=eq.${id}`,
       }, (payload) => {
-        const msg = payload.new as ChatMessage
-        if (!roomStore.messages.find(m => m.id === msg.id)) {
-          roomStore.messages.push(msg)
-        }
+        // Always go through pushRemoteMessage (dedupe + profile enrich)
+        const row = payload.new as Record<string, unknown>
+        roomStore.pushRemoteMessage({
+          ...row,
+          room_id: row.room_id || id,
+        })
       })
       .on('postgres_changes', {
         event: 'UPDATE',

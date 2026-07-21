@@ -56,8 +56,11 @@ const readySummary = computed(() => {
 })
 
 useRoomRealtime(computed(() => room.value?.id))
+const channel = useRoomChannel(computed(() => room.value?.id))
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
+let chatPollTimer: ReturnType<typeof setInterval> | null = null
+let offChat: (() => void) | null = null
 
 onMounted(async () => {
   try {
@@ -70,6 +73,11 @@ onMounted(async () => {
       await roomStore.refreshLobbyState()
     }
     play('join')
+
+    await channel.waitSubscribed()
+    offChat = channel.onChat((raw) => {
+      roomStore.pushRemoteMessage(raw)
+    })
   } catch (e: unknown) {
     toast.error(e instanceof Error ? e.message : 'Gagal masuk lobby')
     await navigateTo('/')
@@ -82,11 +90,36 @@ onMounted(async () => {
     if (room.value?.status === 'playing') return
     roomStore.refreshLobbyState()
   }, 2000)
+
+  // Chat poll fallback (same as in-game) — avoids missing/duplicated empty-nick messages
+  chatPollTimer = setInterval(() => {
+    void pollLobbyChat()
+  }, 2000)
+  void pollLobbyChat()
 })
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  if (chatPollTimer) clearInterval(chatPollTimer)
+  offChat?.()
 })
+
+async function pollLobbyChat() {
+  const roomId = room.value?.id
+  if (!roomId || room.value?.status === 'playing') return
+  try {
+    const last = [...messages.value].reverse().find(m => m.room_id === roomId)
+    const qs = new URLSearchParams({ room_id: roomId })
+    if (last?.created_at) qs.set('since', last.created_at)
+    const res = await $fetch<{ messages: typeof messages.value }>(`/api/rooms/chat?${qs}`)
+    for (const m of res.messages || []) {
+      roomStore.pushRemoteMessage({
+        ...(m as unknown as Record<string, unknown>),
+        room_id: m.room_id || roomId,
+      })
+    }
+  } catch { /* ignore */ }
+}
 
 watch(
   () => room.value?.status,
@@ -195,9 +228,26 @@ async function leave() {
 }
 
 async function sendLobbyChat() {
-  if (!chatInput.value.trim()) return
-  await roomStore.sendChat(chatInput.value.trim())
+  const text = chatInput.value.trim()
+  if (!text) return
   chatInput.value = ''
+  const msg = await roomStore.sendChat(text, 'chat')
+  if (!msg) return
+  // Broadcast with profile so peers never show ": message"
+  await channel.sendChat({
+    id: msg.id,
+    room_id: msg.room_id,
+    user_id: msg.user_id,
+    message: msg.message,
+    message_type: msg.message_type,
+    is_hidden: msg.is_hidden,
+    created_at: msg.created_at,
+    profile: msg.profile,
+  })
+}
+
+function lobbyNick(m: { user_id: string; profile?: { nickname?: string | null } | null }) {
+  return roomStore.chatNickname(m as Parameters<typeof roomStore.chatNickname>[0])
 }
 </script>
 
@@ -343,7 +393,7 @@ async function sendLobbyChat() {
         <div class="border-b border-slate-700 px-3 py-2 text-sm font-black">Chat</div>
         <div class="flex-1 space-y-1 overflow-y-auto p-3">
           <div v-for="m in messages" :key="m.id" class="text-sm">
-            <span class="font-bold text-blue-400">{{ m.profile?.nickname }}:</span>
+            <span class="font-bold text-blue-400">{{ lobbyNick(m) }}:</span>
             {{ m.message }}
           </div>
         </div>

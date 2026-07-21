@@ -200,13 +200,9 @@ async function send() {
   }
 
   if (game.canGuess) {
-    // 1) Local + broadcast guess text so drawer sees it immediately
+    // sendChat already persists via /api/rooms/chat — only broadcast (no 2nd POST)
     const guessMsg = await roomStore.sendChat(text, 'guess')
-    if (guessMsg) {
-      await pushAndBroadcast(guessMsg)
-      // 2) Server persist for poll
-      await postServerChat(text, 'guess', guessMsg.id)
-    }
+    if (guessMsg) await pushAndBroadcast(guessMsg)
 
     const result = await game.submitGuess(text)
 
@@ -216,10 +212,7 @@ async function send() {
 
       const correctText = `✓ Benar! (+${result.points})`
       const correctMsg = await roomStore.sendChat(correctText, 'correct')
-      if (correctMsg) {
-        await pushAndBroadcast(correctMsg)
-        await postServerChat(correctText, 'correct', correctMsg.id)
-      }
+      if (correctMsg) await pushAndBroadcast(correctMsg)
 
       const scores = roomStore.members.map(m => ({ user_id: m.user_id, score: m.score }))
       await channel.sendGame('guess_result', {
@@ -254,11 +247,9 @@ async function send() {
       })
     }
   } else {
+    // sendChat already POSTs once — only broadcast to peers
     const msg = await roomStore.sendChat(text, 'chat')
-    if (msg) {
-      await pushAndBroadcast(msg)
-      await postServerChat(text, 'chat', msg.id)
-    }
+    if (msg) await pushAndBroadcast(msg)
     play('click')
   }
 
@@ -327,15 +318,15 @@ function msgClass(type: string) {
         :class="msgClass(m.message_type)"
       >
         <template v-if="m.message_type === 'correct'">
-          <span class="font-black text-emerald-300">{{ m.profile?.nickname || 'Player' }}</span>
+          <span class="font-black text-emerald-300">{{ roomStore.chatNickname(m) }}</span>
           {{ m.message }}
         </template>
         <template v-else-if="m.message_type === 'guess'">
-          <span class="font-bold text-sky-400">{{ m.profile?.nickname || 'Player' }}:</span>
+          <span class="font-bold text-sky-400">{{ roomStore.chatNickname(m) }}:</span>
           {{ m.message }}
         </template>
         <template v-else>
-          <span class="font-bold text-blue-400">{{ m.profile?.nickname || 'Player' }}:</span>
+          <span class="font-bold text-blue-400">{{ roomStore.chatNickname(m) }}:</span>
           {{ m.message }}
         </template>
       </div>
