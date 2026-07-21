@@ -10,6 +10,21 @@ const strokeHandlers = new Map<string, Set<(strokes: DrawingStroke[]) => void>>(
 const gameHandlers = new Map<string, Set<(type: string, data: Record<string, unknown>) => void>>()
 const chatHandlers = new Map<string, Set<(msg: Record<string, unknown>) => void>>()
 
+export type LiveStrokePayload = {
+  round_id: string
+  color: string
+  size: number
+  tool: string
+  is_eraser: boolean
+  /** Normalized 0–1 points preferred; raw px accepted with canvas_w/h */
+  points: { x: number; y: number }[]
+  seq: number
+  canvas_w?: number
+  canvas_h?: number
+  /** true = points are 0–1 */
+  normalized?: boolean
+}
+
 function handlersFor<T extends AnyHandler>(map: Map<string, Set<T>>, id: string): Set<T> {
   if (!map.has(id)) map.set(id, new Set())
   return map.get(id)!
@@ -33,7 +48,6 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
       console.warn('[channel] no supabase client')
       return null
     }
-    // Allow subscribe even without auth.user for anon if needed
     if (channels.has(id)) return channels.get(id)!
 
     const key = auth.user?.id || `anon-${Math.random().toString(36).slice(2)}`
@@ -46,9 +60,19 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
 
     ch.on('broadcast', { event: 'stroke' }, ({ payload }) => {
       try {
-        const { round_id, data } = payload as { round_id: string; data: unknown[][] }
+        const { round_id, data, canvas_w, canvas_h, normalized } = payload as {
+          round_id: string
+          data: unknown[][]
+          canvas_w?: number
+          canvas_h?: number
+          normalized?: boolean
+        }
         if (!data?.length) return
-        const strokes = data.map(d => deserializeStroke(d, round_id))
+        const strokes = data.map((d) => {
+          const s = deserializeStroke(d, round_id)
+          if (canvas_w) (s.shape_data = { ...(s.shape_data || {}), canvas_w, canvas_h, normalized })
+          return s
+        })
         handlersFor(strokeHandlers, id).forEach(fn => fn(strokes))
       } catch (e) {
         console.warn('[channel] stroke parse', e)
@@ -57,15 +81,7 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
 
     ch.on('broadcast', { event: 'stroke_live' }, ({ payload }) => {
       try {
-        const p = payload as {
-          round_id: string
-          color: string
-          size: number
-          tool: string
-          is_eraser: boolean
-          points: { x: number; y: number }[]
-          seq: number
-        }
+        const p = payload as LiveStrokePayload
         if (!p.points?.length) return
         const stroke: DrawingStroke = {
           round_id: p.round_id || 'live',
@@ -77,7 +93,12 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
           points: p.points,
           is_eraser: !!p.is_eraser,
           timestamp_ms: Date.now(),
-          shape_data: { live: true },
+          shape_data: {
+            live: true,
+            canvas_w: p.canvas_w,
+            canvas_h: p.canvas_h,
+            normalized: p.normalized ?? true,
+          },
         }
         handlersFor(strokeHandlers, id).forEach(fn => fn([stroke]))
       } catch (e) {
@@ -107,7 +128,6 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
     })
 
     ch.on('broadcast', { event: 'chat' }, ({ payload }) => {
-      console.log('[channel] chat received', payload)
       handlersFor(chatHandlers, id).forEach(fn => fn((payload || {}) as Record<string, unknown>))
     })
 
@@ -117,6 +137,11 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
     ch.subscribe((status) => {
       console.log('[channel] status', id.slice(0, 8), status)
       subscribed.set(id, status === 'SUBSCRIBED')
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        // Drop cache so next ensure recreates
+        channels.delete(id)
+        subscribed.set(id, false)
+      }
     })
 
     return ch
@@ -129,7 +154,7 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
     const start = Date.now()
     while (Date.now() - start < ms) {
       if (subscribed.get(id)) return true
-      await new Promise(r => setTimeout(r, 50))
+      await new Promise(r => setTimeout(r, 40))
     }
     return !!subscribed.get(id)
   }
@@ -174,7 +199,6 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
       ensureChannel(id)
       handlersFor(chatHandlers, id).add(fn)
       currentId = id
-      console.log('[channel] chat handler attached', id.slice(0, 8), 'count', handlersFor(chatHandlers, id).size)
     }
     const stop = watch(() => unref(roomId), (id) => {
       if (currentId) handlersFor(chatHandlers, currentId).delete(fn)
@@ -186,36 +210,51 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
     }
   }
 
-  async function sendStrokes(strokes: DrawingStroke[]) {
+  async function sendStrokes(
+    strokes: DrawingStroke[],
+    meta?: { canvas_w?: number; canvas_h?: number; normalized?: boolean },
+  ) {
     const id = getId()
-    if (!id || !strokes.length) return
+    if (!id || !strokes.length) return false
     await waitSubscribed(id)
     const ch = ensureChannel(id)
-    ch?.send({
-      type: 'broadcast',
-      event: 'stroke',
-      payload: {
-        round_id: strokes[0].round_id,
-        data: strokes.map(serializeStroke),
-      },
-    })
+    if (!ch) return false
+    try {
+      const res = await ch.send({
+        type: 'broadcast',
+        event: 'stroke',
+        payload: {
+          round_id: strokes[0].round_id,
+          data: strokes.map(serializeStroke),
+          canvas_w: meta?.canvas_w,
+          canvas_h: meta?.canvas_h,
+          normalized: meta?.normalized ?? true,
+        },
+      })
+      return res === 'ok' || res === undefined || (res as { status?: string })?.status === 'ok'
+    } catch (e) {
+      console.warn('[channel] sendStrokes failed', e)
+      return false
+    }
   }
 
-  async function sendLiveStroke(payload: {
-    round_id: string
-    color: string
-    size: number
-    tool: string
-    is_eraser: boolean
-    points: { x: number; y: number }[]
-    seq: number
-  }) {
+  async function sendLiveStroke(payload: LiveStrokePayload) {
     const id = getId()
-    if (!id) return
+    if (!id) return false
     const ch = ensureChannel(id)
-    // don't wait every frame — fire and forget if subscribed
-    if (!subscribed.get(id)) await waitSubscribed(id, 1000)
-    ch?.send({ type: 'broadcast', event: 'stroke_live', payload })
+    if (!ch) return false
+    if (!subscribed.get(id)) await waitSubscribed(id, 1500)
+    try {
+      await ch.send({
+        type: 'broadcast',
+        event: 'stroke_live',
+        payload: { ...payload, normalized: payload.normalized ?? true },
+      })
+      return true
+    } catch (e) {
+      console.warn('[channel] sendLiveStroke failed', e)
+      return false
+    }
   }
 
   async function sendClear() {
@@ -233,12 +272,11 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
     }
     await waitSubscribed(id)
     const ch = ensureChannel(id)
-    const res = ch?.send({
+    ch?.send({
       type: 'broadcast',
       event: 'game',
       payload: { type, data },
     })
-    console.log('[channel] sendGame', type, res)
   }
 
   async function sendChat(msg: Record<string, unknown>) {
@@ -251,12 +289,11 @@ export function useRoomChannel(roomId: Ref<string | null | undefined>) {
     if (!ok) console.warn('[channel] sendChat not subscribed yet, trying anyway')
     const ch = ensureChannel(id)
     if (!ch) return false
-    const res = await ch.send({
+    await ch.send({
       type: 'broadcast',
       event: 'chat',
       payload: msg,
     })
-    console.log('[channel] sendChat', msg.message, res)
     return true
   }
 

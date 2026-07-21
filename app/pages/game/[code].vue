@@ -33,6 +33,14 @@ let last: StrokePoint | null = null
 let pts: StrokePoint[] = []
 let liveSeq = 0
 let liveThrottle: ReturnType<typeof setTimeout> | null = null
+/** Index of last point already relayed in current stroke (gap-free live) */
+let liveSentIdx = 0
+/** Poll cursor for server stroke buffer */
+let pollAfterSeq = 0
+let strokePollTimer: ReturnType<typeof setInterval> | null = null
+/** Dedupe remote live paints by seq */
+const seenLiveSeq = new Set<number>()
+const seenCommitKey = new Set<string>()
 
 const channel = useRoomChannel(computed(() => room.value?.id))
 
@@ -61,9 +69,10 @@ const hintDisplay = computed(() => {
   return '…'
 })
 
-// —— Realtime: apply remote strokes to canvas immediately ——
+// —— Realtime + poll: apply remote strokes to canvas ——
 let offStrokes: (() => void) | null = null
 let offGame: (() => void) | null = null
+let offBus: (() => boolean) | null = null
 
 onMounted(async () => {
   try {
@@ -84,12 +93,20 @@ onMounted(async () => {
       return
     }
 
-    // Wire realtime handlers
+    // Wire realtime handlers ASAP
+    await channel.waitSubscribed()
     offStrokes = channel.onStrokes((remote) => {
       handleRemoteStrokes(remote)
     })
     offGame = channel.onGame((type, data) => {
       handleGameEvent(type, data)
+    })
+
+    // Bridge store stroke bus → channel + server
+    const bus = useStrokeBus()
+    offBus = bus.on((batch) => {
+      if (!batch?.length || !isDrawer.value) return
+      void relayCommitStrokes(batch)
     })
 
     statusMsg.value = 'round'
@@ -110,7 +127,9 @@ onMounted(async () => {
       if (phase.value === 'idle') await game.beginRound()
     }
 
-    statusMsg.value = isDrawer.value ? 'DRAWER' : 'GUESSER'
+    startStrokePoll()
+
+    statusMsg.value = `${isDrawer.value ? 'DRAWER' : 'GUESSER'} · rt:${channel.channelStatus()}`
     toast.success(
       isDrawer.value ? 'Giliranmu menggambar — pilih kata!' : `${drawerName.value} memilih kata...`,
     )
@@ -125,6 +144,9 @@ onMounted(async () => {
 onUnmounted(() => {
   offStrokes?.()
   offGame?.()
+  offBus?.()
+  stopStrokePoll()
+  if (liveThrottle) clearTimeout(liveThrottle)
 })
 
 function handleGameEvent(type: string, data: Record<string, unknown>) {
@@ -158,13 +180,20 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
   } else if (type === 'word_selected') {
     const dId = String(data.drawerId || '')
     if (auth.user?.id && dId === auth.user.id) return
+    pollAfterSeq = 0
+    seenLiveSeq.clear()
+    seenCommitKey.clear()
     game.onRemoteWordSelected({
       word: String(data.word || ''),
       drawerId: dId,
       drawTime: Number(data.drawTime) || 60,
       roundId: data.roundId as string | undefined,
     })
-    nextTick(() => setupCanvas(true))
+    nextTick(() => {
+      setupCanvas(true)
+      setTimeout(() => setupCanvas(true), 80)
+      setTimeout(() => setupCanvas(true), 250)
+    })
   } else if (type === 'game_over') {
     if (Array.isArray(data.scores)) {
       for (const s of data.scores as { user_id: string; score: number }[]) {
@@ -177,36 +206,242 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
 }
 
 function handleRemoteStrokes(remote: DrawingStroke[]) {
+  // Ignore own strokes if echoed
+  if (isDrawer.value) return
+
   // Clear signal
   if (remote.some(s => s.shape_data && (s.shape_data as { clear?: boolean }).clear)) {
     game.strokes.splice(0, game.strokes.length)
+    seenLiveSeq.clear()
+    seenCommitKey.clear()
     setupCanvas(true)
     return
   }
 
-  if (!ctx) setupCanvas(true)
+  ensureCtxReady()
 
-  // Committed strokes (sequence >= 0) go to store
-  const fullOnly = remote.filter(
-    s => s.points.length >= 2
-      && typeof s.sequence === 'number'
-      && s.sequence >= 0
-      && !(s.shape_data as { live?: boolean } | null)?.live,
-  )
-  if (fullOnly.length) {
-    game.applyRemoteStrokes(fullOnly)
-  }
-
-  // Paint every remote segment immediately (live + final) so guessers see drawing
-  if (!ctx) setupCanvas(true)
   for (const s of remote) {
     if (!s.points || s.points.length < 2) continue
+
+    const meta = (s.shape_data || {}) as {
+      live?: boolean
+      canvas_w?: number
+      canvas_h?: number
+      normalized?: boolean
+    }
+    const isLive = !!meta.live || s.sequence < 0
+
+    if (isLive) {
+      if (seenLiveSeq.has(s.sequence)) continue
+      seenLiveSeq.add(s.sequence)
+      // Cap set size
+      if (seenLiveSeq.size > 2000) {
+        const arr = [...seenLiveSeq].slice(-500)
+        seenLiveSeq.clear()
+        arr.forEach(n => seenLiveSeq.add(n))
+      }
+    } else {
+      const key = `${s.sequence}:${s.timestamp_ms}`
+      if (seenCommitKey.has(key)) continue
+      seenCommitKey.add(key)
+      game.applyRemoteStrokes([s])
+    }
+
+    const localPts = toLocalPoints(s.points, meta)
     paintSegment(
-      s.points,
+      localPts,
       s.color || '#000000',
       s.size || 6,
       !!(s.is_eraser || s.tool === 'eraser'),
     )
+  }
+
+  statusMsg.value = `stroke in · rt:${channel.channelStatus()}`
+}
+
+/** Map remote points (normalized 0–1 or raw px) → local canvas pixels */
+function toLocalPoints(
+  points: StrokePoint[],
+  meta: { canvas_w?: number; canvas_h?: number; normalized?: boolean },
+): StrokePoint[] {
+  const c = canvasEl.value
+  const lw = c?.width || 800
+  const lh = c?.height || 400
+
+  const looksNormalized = meta.normalized
+    ?? points.every(p => p.x <= 1.5 && p.y <= 1.5 && p.x >= -0.1 && p.y >= -0.1)
+
+  if (looksNormalized) {
+    return points.map(p => ({ x: p.x * lw, y: p.y * lh, ...(p.p !== undefined ? { p: p.p } : {}) }))
+  }
+
+  // Scale from drawer canvas size if provided
+  const sw = meta.canvas_w || 800
+  const sh = meta.canvas_h || 400
+  return points.map(p => ({
+    x: (p.x / sw) * lw,
+    y: (p.y / sh) * lh,
+    ...(p.p !== undefined ? { p: p.p } : {}),
+  }))
+}
+
+function canvasSize() {
+  const c = canvasEl.value
+  return { w: c?.width || 800, h: c?.height || 400 }
+}
+
+function normalizePoints(points: StrokePoint[]): StrokePoint[] {
+  const { w, h } = canvasSize()
+  return points.map(p => ({
+    x: p.x / Math.max(1, w),
+    y: p.y / Math.max(1, h),
+    ...(p.p !== undefined ? { p: p.p } : {}),
+  }))
+}
+
+async function postStrokeServer(body: Record<string, unknown>) {
+  if (!room.value?.id) return
+  const token = await auth.getAccessToken()
+  if (!token) return
+  try {
+    await $fetch('/api/rooms/strokes', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: { room_id: room.value.id, ...body },
+    })
+  } catch (e) {
+    console.warn('[stroke] server post failed', e)
+  }
+}
+
+function relayLiveSegment(slice: StrokePoint[]) {
+  if (slice.length < 2 || !isDrawer.value) return
+  const { w, h } = canvasSize()
+  const norm = normalizePoints(slice)
+  const roundId = roomStore.currentRound?.id || 'live'
+  const seq = liveSeq++
+  const payload = {
+    round_id: roundId,
+    color: ink.value,
+    size: brushSize.value,
+    tool: tool.value,
+    is_eraser: tool.value === 'eraser',
+    points: norm.map(pt => ({ x: pt.x, y: pt.y })),
+    seq,
+    canvas_w: w,
+    canvas_h: h,
+    normalized: true,
+  }
+  void channel.sendLiveStroke(payload)
+  void postStrokeServer({
+    kind: 'live',
+    round_id: roundId,
+    tool: tool.value,
+    color: ink.value,
+    size: brushSize.value,
+    is_eraser: tool.value === 'eraser',
+    points: payload.points,
+    canvas_w: w,
+    canvas_h: h,
+  })
+}
+
+async function relayCommitStrokes(batch: DrawingStroke[]) {
+  if (!batch.length || !isDrawer.value) return
+  const { w, h } = canvasSize()
+  // Normalize points for cross-device scale
+  const normalized = batch.map(s => ({
+    ...s,
+    points: normalizePoints(s.points),
+  }))
+  void channel.sendStrokes(normalized, { canvas_w: w, canvas_h: h, normalized: true })
+  for (const s of normalized) {
+    void postStrokeServer({
+      kind: 'commit',
+      round_id: s.round_id,
+      tool: s.tool,
+      color: s.color,
+      size: s.size,
+      is_eraser: s.is_eraser,
+      points: s.points,
+      canvas_w: w,
+      canvas_h: h,
+    })
+  }
+}
+
+function startStrokePoll() {
+  stopStrokePoll()
+  strokePollTimer = setInterval(() => {
+    void pollStrokes()
+  }, 280)
+}
+
+function stopStrokePoll() {
+  if (strokePollTimer) {
+    clearInterval(strokePollTimer)
+    strokePollTimer = null
+  }
+}
+
+async function pollStrokes() {
+  // Guesser only — drawer already has local ink
+  if (isDrawer.value || !room.value?.id) return
+  if (phase.value !== 'drawing' && phase.value !== 'revealing') return
+  try {
+    const res = await $fetch<{
+      strokes: Array<{
+        seq: number
+        kind: string
+        round_id: string
+        tool: string
+        color: string
+        size: number
+        is_eraser: boolean
+        points: StrokePoint[]
+        canvas_w?: number
+        canvas_h?: number
+        user_id: string
+      }>
+      last_seq: number
+    }>(`/api/rooms/strokes?room_id=${encodeURIComponent(room.value.id)}&after=${pollAfterSeq}`)
+
+    if (res.last_seq > pollAfterSeq) pollAfterSeq = res.last_seq
+    if (!res.strokes?.length) return
+
+    for (const s of res.strokes) {
+      // Skip own
+      if (s.user_id && s.user_id === auth.user?.id) continue
+
+      if (s.kind === 'clear') {
+        game.strokes.splice(0, game.strokes.length)
+        seenLiveSeq.clear()
+        seenCommitKey.clear()
+        setupCanvas(true)
+        continue
+      }
+
+      const asStroke: DrawingStroke = {
+        round_id: s.round_id || 'live',
+        sequence: s.kind === 'live' ? -(s.seq) : s.seq,
+        tool: (s.tool as DrawingStroke['tool']) || 'pen',
+        color: s.color || '#000',
+        size: s.size || 6,
+        opacity: 1,
+        points: s.points || [],
+        is_eraser: !!s.is_eraser,
+        timestamp_ms: Date.now(),
+        shape_data: {
+          live: s.kind === 'live',
+          canvas_w: s.canvas_w,
+          canvas_h: s.canvas_h,
+          normalized: true,
+        },
+      }
+      handleRemoteStrokes([asStroke])
+    }
+  } catch {
+    // silent — Realtime may still work
   }
 }
 
@@ -215,6 +450,9 @@ function pick(w: WordChoice) {
     toast.error('Bukan giliranmu menggambar')
     return
   }
+  pollAfterSeq = 0
+  seenLiveSeq.clear()
+  seenCommitKey.clear()
   game.selectWord(w)
   channel.sendGame('word_selected', {
     word: w.text,
@@ -233,22 +471,35 @@ function pick(w: WordChoice) {
 watch(phase, (p) => {
   if (p === 'drawing') {
     play('countdown')
-    nextTick(() => setupCanvas(true))
+    nextTick(() => {
+      setupCanvas(true)
+      setTimeout(() => setupCanvas(true), 100)
+    })
   }
 })
 
-/** Setup white canvas. forceFill=true always paints white background */
-function setupCanvas(forceFill = true) {
+/**
+ * Setup white canvas.
+ * forceResize=true resets bitmap (clear + replay strokes).
+ * forceResize=false only acquires ctx if missing — does NOT wipe drawing.
+ */
+function setupCanvas(forceResize = true) {
   const c = canvasEl.value
   if (!c) return
 
   const box = c.parentElement
-  const w = Math.max(300, Math.floor(box?.clientWidth || window.innerWidth - 40))
+  // Prefer visible parent width; fall back to window when v-show still 0
+  let w = Math.floor(box?.clientWidth || 0)
+  if (w < 50) w = Math.max(300, Math.floor(window.innerWidth - 48))
   const h = 400
 
-  // Setting width/height resets the bitmap — always re-fill white after
-  c.width = w
-  c.height = h
+  const needsResize = forceResize || c.width !== w || c.height !== h || !ctx
+
+  if (needsResize) {
+    // Setting width/height resets the bitmap
+    c.width = w
+    c.height = h
+  }
   c.style.width = '100%'
   c.style.height = `${h}px`
   c.style.backgroundColor = '#ffffff'
@@ -258,31 +509,36 @@ function setupCanvas(forceFill = true) {
   ctx = c.getContext('2d')
   if (!ctx) return
 
-  ctx.setTransform(1, 0, 0, 1, 0, 0)
-  ctx.globalCompositeOperation = 'source-over'
-  ctx.globalAlpha = 1
-  ctx.fillStyle = '#ffffff'
-  ctx.fillRect(0, 0, w, h)
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  statusMsg.value = `canvas putih ${w}x${h}`
+  if (needsResize) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.globalCompositeOperation = 'source-over'
+    ctx.globalAlpha = 1
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, w, h)
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    statusMsg.value = `canvas ${w}x${h} · rt:${channel.channelStatus()}`
 
-  if (forceFill) {
+    // Replay committed strokes (may be normalized or local px)
     for (const s of strokes.value) {
       if (s.points?.length >= 2) {
-        paintSegment(s.points, s.color, s.size, !!(s.is_eraser || s.tool === 'eraser'))
+        const meta = (s.shape_data || {}) as { canvas_w?: number; canvas_h?: number; normalized?: boolean }
+        const local = toLocalPoints(s.points, meta)
+        paintSegmentRaw(local, s.color, s.size, !!(s.is_eraser || s.tool === 'eraser'))
       }
     }
   }
 }
 
-function ensureCtx() {
-  if (!ctx || !canvasEl.value) setupCanvas(false)
+/** Get ctx without wiping existing drawing */
+function ensureCtxReady() {
+  if (ctx && canvasEl.value && canvasEl.value.width > 0) return true
+  setupCanvas(true)
   return !!ctx
 }
 
-function paintSegment(points: StrokePoint[], col: string, sz: number, erase: boolean) {
-  if (!ensureCtx() || !ctx || points.length < 1) return
+function paintSegmentRaw(points: StrokePoint[], col: string, sz: number, erase: boolean) {
+  if (!ctx || points.length < 1) return
   ctx.save()
   if (erase) {
     ctx.globalCompositeOperation = 'destination-out'
@@ -302,6 +558,11 @@ function paintSegment(points: StrokePoint[], col: string, sz: number, erase: boo
   }
   ctx.stroke()
   ctx.restore()
+}
+
+function paintSegment(points: StrokePoint[], col: string, sz: number, erase: boolean) {
+  if (!ensureCtxReady() || !ctx || points.length < 1) return
+  paintSegmentRaw(points, col, sz, erase)
 }
 
 function pos(e: PointerEvent): StrokePoint {
@@ -336,6 +597,7 @@ function down(e: PointerEvent) {
   painting.value = true
   last = pos(e)
   pts = [last]
+  liveSentIdx = 0
   styleLocal()
   ctx.beginPath()
   ctx.moveTo(last.x, last.y)
@@ -352,25 +614,20 @@ function move(e: PointerEvent) {
   ctx.lineTo(p.x, p.y)
   ctx.stroke()
 
-  // Live broadcast every ~40ms so guessers see drawing in real-time
+  // Live relay every ~55ms — gap-free (from last sent index)
   if (!liveThrottle) {
     liveThrottle = setTimeout(() => {
       liveThrottle = null
-      const roundId = roomStore.currentRound?.id || 'live'
-      // send last segment (last few points)
-      const slice = pts.slice(-12)
-      if (slice.length >= 2) {
-        channel.sendLiveStroke({
-          round_id: roundId,
-          color: ink.value,
-          size: brushSize.value,
-          tool: tool.value,
-          is_eraser: tool.value === 'eraser',
-          points: slice.map(pt => ({ x: pt.x, y: pt.y })),
-          seq: liveSeq++,
-        })
+      if (pts.length - liveSentIdx >= 1) {
+        // Overlap 1 point so segments connect on receiver
+        const from = Math.max(0, liveSentIdx - 1)
+        const slice = pts.slice(from)
+        if (slice.length >= 2) {
+          relayLiveSegment(slice)
+          liveSentIdx = pts.length
+        }
       }
-    }, 40)
+    }, 55)
   }
 
   last = p
@@ -384,8 +641,14 @@ function up(e: PointerEvent) {
     clearTimeout(liveThrottle)
     liveThrottle = null
   }
+  // Flush remaining live segment
+  if (pts.length - liveSentIdx >= 1) {
+    const from = Math.max(0, liveSentIdx - 1)
+    const slice = pts.slice(from)
+    if (slice.length >= 2) relayLiveSegment(slice)
+  }
   if (pts.length > 1 && canDraw.value) {
-    // Commit full stroke to store + reliable broadcast
+    // Commit full stroke to store (bus → channel + server)
     game.addStroke({
       tool: tool.value,
       color: ink.value,
@@ -394,14 +657,15 @@ function up(e: PointerEvent) {
       points: [...pts],
       is_eraser: tool.value === 'eraser',
     })
-    // Also send immediately via channel (don't wait only on bus)
+    // Immediate send (don't wait for bus batch timer)
     const lastStroke = game.strokes[game.strokes.length - 1]
     if (lastStroke) {
-      channel.sendStrokes([lastStroke])
+      void relayCommitStrokes([lastStroke])
     }
   }
   last = null
   pts = []
+  liveSentIdx = 0
   if (ctx) ctx.globalCompositeOperation = 'source-over'
 }
 
@@ -409,17 +673,11 @@ function clearAll() {
   if (!canDraw.value) return
   game.clearCanvas()
   channel.sendClear()
+  void postStrokeServer({ kind: 'clear' })
+  seenLiveSeq.clear()
+  seenCommitKey.clear()
   setupCanvas(true)
 }
-
-// Bridge store stroke bus → realtime channel
-onMounted(() => {
-  const bus = useStrokeBus()
-  const off = bus.on((batch) => {
-    if (batch?.length) channel.sendStrokes(batch)
-  })
-  onUnmounted(() => { off() })
-})
 </script>
 
 <template>

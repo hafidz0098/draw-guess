@@ -23,7 +23,8 @@ export function useSupabase(): SupabaseClient | null {
       detectSessionInUrl: import.meta.client,
     },
     realtime: {
-      params: { eventsPerSecond: 20 },
+      // Live drawing needs higher burst rate (stroke_live ~15/s + chat/game)
+      params: { eventsPerSecond: 40 },
     },
   })
 
