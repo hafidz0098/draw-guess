@@ -132,14 +132,11 @@ export const useGameStore = defineStore('game', () => {
     roundNumber.value = forcedRound || room.current_round || 1
     room.current_round = roundNumber.value
 
-    strokes.value = []
-    strokeSequence.value = 0
+    wipeStrokes()
     correctGuessers.value = new Set()
     selectedWord.value = null
     wordHint.value = []
     lastScores.value = []
-    undoStack.value = []
-    redoStack.value = []
 
     let players = [...roomStore.connectedPlayers]
     if (!players.length) {
@@ -296,6 +293,8 @@ export const useGameStore = defineStore('game', () => {
       drawerId.value = auth.user.id
     }
 
+    // New word = blank canvas (drop leftover strokes from previous turn)
+    wipeStrokes()
     selectedWord.value = choice.text
     wordHint.value = buildWordHint(choice.text, 0)
     phase.value = 'drawing' // ← critical UI switch
@@ -355,6 +354,8 @@ export const useGameStore = defineStore('game', () => {
     drawTime?: number
     roundId?: string
   }) {
+    // Fresh board every time a word is picked (prevents stacked old drawings)
+    wipeStrokes()
     // Keep remote drawer — never overwrite with self
     if (payload.drawerId) {
       drawerId.value = payload.drawerId
@@ -497,6 +498,14 @@ export const useGameStore = defineStore('game', () => {
     undoStack.value.push([...strokes.value])
     redoStack.value = []
     strokes.value = []
+  }
+
+  /** Force wipe strokes (round change / role swap) — no canDraw gate */
+  function wipeStrokes() {
+    strokes.value = []
+    strokeSequence.value = 0
+    undoStack.value = []
+    redoStack.value = []
   }
 
   async function submitGuess(text: string): Promise<{
@@ -681,7 +690,7 @@ export const useGameStore = defineStore('game', () => {
     roundNumber.value = payload.roundNumber
     selectedWord.value = null
     wordHint.value = []
-    strokes.value = []
+    wipeStrokes()
     correctGuessers.value = new Set()
     clearTimers()
 
@@ -773,6 +782,7 @@ export const useGameStore = defineStore('game', () => {
     undo,
     redo,
     clearCanvas,
+    wipeStrokes,
     submitGuess,
     applyCorrectGuess,
     endRound,

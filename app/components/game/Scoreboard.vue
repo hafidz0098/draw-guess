@@ -35,6 +35,19 @@ async function goNext() {
       return
     }
 
+    // Clear stroke buffer so previous drawer art never reappears for guessers
+    try {
+      channel.sendClear()
+      const token = await useAuthStore().getAccessToken()
+      if (token && room.value?.id) {
+        await $fetch('/api/rooms/strokes', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: { room_id: room.value.id, kind: 'clear' },
+        })
+      }
+    } catch { /* best-effort */ }
+
     // Broadcast so ALL clients leave scoreboard → selecting
     await channel.sendGame('next_round', {
       roundNumber: result.roundNumber,

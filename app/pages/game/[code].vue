@@ -174,11 +174,46 @@ onUnmounted(() => {
   if (liveThrottle) clearTimeout(liveThrottle)
 })
 
+/** Active round id for filtering stale relay strokes */
+const activeRoundId = computed(() => roomStore.currentRound?.id || '')
+
+/**
+ * Blank the board completely (store + pixels + dedupe).
+ * broadcast=true also clears server stroke buffer so poll won't re-stack old art.
+ */
+function resetDrawingSurface(opts?: { broadcast?: boolean }) {
+  game.wipeStrokes()
+  seenLiveSeq.clear()
+  seenCommitKey.clear()
+  // Do NOT set pollAfterSeq=0 (that reloads ALL historical buffer strokes)
+  if (opts?.broadcast) {
+    void channel.sendClear()
+    void postStrokeServer({ kind: 'clear' })
+  }
+  // Force white bitmap even if setup thinks size unchanged
+  const c = canvasEl.value
+  if (c && ctx) {
+    const dpr = getDpr()
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.globalCompositeOperation = 'source-over'
+    ctx.globalAlpha = 1
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H)
+  } else {
+    nextTick(() => setupCanvas(true))
+  }
+  // Always re-run full setup so buffer size + white fill is consistent
+  nextTick(() => setupCanvas(true))
+}
+
 function handleGameEvent(type: string, data: Record<string, unknown>) {
   if (type === 'next_round' || type === 'round_start') {
     // ALL non-initiating clients (and host if echo): leave scoreboard → selecting
     const dId = String(data.drawerId || '')
     const rn = Number(data.roundNumber) || 1
+
+    // Wipe previous drawer's art for everyone (including host)
+    resetDrawingSurface({ broadcast: type === 'next_round' && isHost.value })
 
     // Host already ran nextRound locally for next_round — skip double begin
     if (type === 'next_round' && isHost.value) {
@@ -195,6 +230,7 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
       drawerId: dId,
       scores: data.scores as { user_id: string; score: number }[] | undefined,
     }).then(() => {
+      resetDrawingSurface({ broadcast: false })
       statusMsg.value = game.isDrawer ? 'DRAWER ronde ' + rn : 'GUESSER ronde ' + rn
       toast.message(
         game.isDrawer
@@ -205,9 +241,8 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
   } else if (type === 'word_selected') {
     const dId = String(data.drawerId || '')
     if (auth.user?.id && dId === auth.user.id) return
-    pollAfterSeq = 0
-    seenLiveSeq.clear()
-    seenCommitKey.clear()
+    // Fresh canvas for guessers — never reset poll to 0 (would re-apply old rounds)
+    resetDrawingSurface({ broadcast: false })
     game.onRemoteWordSelected({
       word: String(data.word || ''),
       drawerId: dId,
@@ -217,8 +252,9 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
     nextTick(() => {
       setupCanvas(true)
       setTimeout(() => setupCanvas(true), 80)
-      setTimeout(() => setupCanvas(true), 250)
     })
+  } else if (type === 'canvas_clear' || type === 'clear_canvas') {
+    resetDrawingSurface({ broadcast: false })
   } else if (type === 'game_over') {
     if (Array.isArray(data.scores)) {
       for (const s of data.scores as { user_id: string; score: number }[]) {
@@ -226,27 +262,40 @@ function handleGameEvent(type: string, data: Record<string, unknown>) {
         if (m) m.score = s.score
       }
     }
+    resetDrawingSurface({ broadcast: false })
     game.finishGame()
   }
 }
 
-function handleRemoteStrokes(remote: DrawingStroke[]) {
-  // Ignore own strokes if echoed
-  if (isDrawer.value) return
+function strokeBelongsToActiveRound(s: DrawingStroke): boolean {
+  const rid = s.round_id
+  if (!rid || rid === 'live' || rid === 'clear') return true
+  const active = activeRoundId.value
+  if (!active) return true
+  // Accept if matches current round
+  if (rid === active) return true
+  // Reject clearly foreign round ids (uuid from previous rounds)
+  return false
+}
 
-  // Clear signal
+function handleRemoteStrokes(remote: DrawingStroke[]) {
+  // Clear signal — always apply (even if we are/were drawer)
   if (remote.some(s => s.shape_data && (s.shape_data as { clear?: boolean }).clear)) {
-    game.strokes.splice(0, game.strokes.length)
+    game.wipeStrokes()
     seenLiveSeq.clear()
     seenCommitKey.clear()
     setupCanvas(true)
     return
   }
 
+  // Drawer paints locally only — ignore remote ink (but clear above still runs)
+  if (isDrawer.value) return
+
   ensureCtxReady()
 
   for (const s of remote) {
     if (!s.points || s.points.length < 2) continue
+    if (!strokeBelongsToActiveRound(s)) continue
 
     const meta = (s.shape_data || {}) as {
       live?: boolean
@@ -468,10 +517,21 @@ async function pollStrokes() {
       if (s.user_id && s.user_id === auth.user?.id) continue
 
       if (s.kind === 'clear') {
-        game.strokes.splice(0, game.strokes.length)
+        game.wipeStrokes()
         seenLiveSeq.clear()
         seenCommitKey.clear()
         setupCanvas(true)
+        continue
+      }
+
+      // Drop strokes from a previous round (stale buffer)
+      const active = activeRoundId.value
+      if (
+        active
+        && s.round_id
+        && s.round_id !== 'live'
+        && s.round_id !== active
+      ) {
         continue
       }
 
@@ -504,9 +564,8 @@ function pick(w: WordChoice) {
     toast.error('Bukan giliranmu menggambar')
     return
   }
-  pollAfterSeq = 0
-  seenLiveSeq.clear()
-  seenCommitKey.clear()
+  // Wipe local + server buffer so previous round's art never stacks for guessers
+  resetDrawingSurface({ broadcast: true })
   game.selectWord(w)
   channel.sendGame('word_selected', {
     word: w.text,
@@ -523,12 +582,32 @@ function pick(w: WordChoice) {
 }
 
 watch(phase, (p) => {
+  if (p === 'selecting' || p === 'scoreboard' || p === 'winner') {
+    // Leaving a draw turn — blank board so role swap never shows old ink
+    resetDrawingSurface({ broadcast: false })
+  }
   if (p === 'drawing') {
     play('countdown')
+    // Start of draw phase: blank first (drawer will paint; guesser waits for relay)
+    // Strokes store already wiped on selectWord / onRemoteWordSelected
     nextTick(() => {
       setupCanvas(true)
       setTimeout(() => setupCanvas(true), 100)
     })
+  }
+})
+
+// Role flip (drawer ↔ guesser) always needs a clean surface
+watch(isDrawer, (now, was) => {
+  if (was === undefined) return
+  if (now !== was) {
+    resetDrawingSurface({ broadcast: false })
+  }
+})
+
+watch(drawerId, (now, was) => {
+  if (was && now && was !== now) {
+    resetDrawingSurface({ broadcast: false })
   }
 })
 
