@@ -55,14 +55,8 @@ const seenCommitKey = new Set<string>()
 
 const channel = useRoomChannel(computed(() => room.value?.id))
 
-const words = computed((): WordChoice[] => {
-  if (wordChoices.value?.length) return wordChoices.value as WordChoice[]
-  return [
-    { id: '1', text: 'Kucing', difficulty: 'easy' },
-    { id: '2', text: 'Pesawat', difficulty: 'easy' },
-    { id: '3', text: 'Helikopter', difficulty: 'medium' },
-  ]
-})
+// Only show store choices — never a hard-coded list (that caused repeated words)
+const words = computed((): WordChoice[] => wordChoices.value || [])
 
 const isSelecting = computed(() => phase.value === 'selecting')
 const isDrawing = computed(() => phase.value === 'drawing' || phase.value === 'revealing')
@@ -581,10 +575,14 @@ function pick(w: WordChoice) {
   })
 }
 
-watch(phase, (p) => {
+watch(phase, async (p) => {
   if (p === 'selecting' || p === 'scoreboard' || p === 'winner') {
     // Leaving a draw turn — blank board so role swap never shows old ink
     resetDrawingSurface({ broadcast: false })
+  }
+  if (p === 'selecting' && isDrawer.value) {
+    // New selecting turn as drawer → always re-roll unused words
+    await game.reloadWordChoices()
   }
   if (p === 'drawing') {
     play('countdown')
@@ -597,17 +595,23 @@ watch(phase, (p) => {
   }
 })
 
-// Role flip (drawer ↔ guesser) always needs a clean surface
-watch(isDrawer, (now, was) => {
+// Role flip (drawer ↔ guesser) always needs a clean surface + fresh word options
+watch(isDrawer, async (now, was) => {
   if (was === undefined) return
   if (now !== was) {
     resetDrawingSurface({ broadcast: false })
+    if (now && phase.value === 'selecting') {
+      await game.reloadWordChoices()
+    }
   }
 })
 
-watch(drawerId, (now, was) => {
+watch(drawerId, async (now, was) => {
   if (was && now && was !== now) {
     resetDrawingSurface({ broadcast: false })
+    if (isDrawer.value && phase.value === 'selecting') {
+      await game.reloadWordChoices()
+    }
   }
 })
 
@@ -847,9 +851,10 @@ function clearAll() {
         <h2 style="font-size:24px;font-weight:900;margin:0 0 8px;">Giliranmu menggambar!</h2>
         <p style="color:#94a3b8;font-size:14px;">Pilih kata — lawan menebak</p>
         <p style="color:#fb923c;font-weight:800;">⏱ {{ timeLeft }}s</p>
+        <p v-if="!words.length" style="color:#94a3b8;margin:16px 0;">Memuat pilihan kata...</p>
         <button
           v-for="w in words"
-          :key="w.id"
+          :key="w.id + '-' + w.text"
           type="button"
           style="display:block;width:100%;margin:10px 0;padding:16px;border-radius:12px;border:2px solid #64748b;background:#0f172a;color:#fff;font-size:20px;font-weight:900;cursor:pointer;text-align:left;"
           @click="pick(w)"

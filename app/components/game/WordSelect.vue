@@ -5,14 +5,8 @@ import type { WordChoice } from '~/types'
 const game = useGameStore()
 const emit = defineEmits<{ selected: [word: string] }>()
 
-const choices = computed((): WordChoice[] => {
-  if (game.wordChoices?.length) return game.wordChoices as WordChoice[]
-  return [
-    { id: 'f1', text: 'Kucing', difficulty: 'easy' },
-    { id: 'f2', text: 'Pesawat', difficulty: 'easy' },
-    { id: 'f3', text: 'Pizza', difficulty: 'medium' },
-  ]
-})
+// Never hard-code the same 3 words — always use session-fresh choices from the store
+const choices = computed((): WordChoice[] => game.wordChoices || [])
 
 function pick(w: WordChoice) {
   // Call store action

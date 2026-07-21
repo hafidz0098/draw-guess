@@ -33,11 +33,37 @@ export const useGameStore = defineStore('game', () => {
   const winnerId = ref<string | null>(null)
   const undoStack = ref<DrawingStroke[][]>([])
   const redoStack = ref<DrawingStroke[][]>([])
+  /** Words already drawn this match — avoid repeats when roles rotate */
+  const usedWordKeys = ref<Set<string>>(new Set())
+  const usedWordIds = ref<Set<string>>(new Set())
 
   let timerInterval: ReturnType<typeof setInterval> | null = null
   let hintInterval: ReturnType<typeof setInterval> | null = null
   let strokeBuffer: DrawingStroke[] = []
   let flushTimer: ReturnType<typeof setTimeout> | null = null
+
+  function wordKey(text: string): string {
+    return text.trim().toLowerCase()
+  }
+
+  function markWordUsed(text: string | null | undefined, id?: string | null) {
+    if (text?.trim()) usedWordKeys.value.add(wordKey(text))
+    if (id) usedWordIds.value.add(id)
+  }
+
+  function clearUsedWords() {
+    usedWordKeys.value = new Set()
+    usedWordIds.value = new Set()
+  }
+
+  /** Fisher–Yates shuffle (unbiased) */
+  function shuffleInPlace<T>(arr: T[]): T[] {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]]
+    }
+    return arr
+  }
 
   const isDrawer = computed(() =>
     !!auth.user?.id && !!drawerId.value && drawerId.value === auth.user.id,
@@ -137,6 +163,12 @@ export const useGameStore = defineStore('game', () => {
     selectedWord.value = null
     wordHint.value = []
     lastScores.value = []
+    wordChoices.value = []
+
+    // New match (round 1) → allow full word pool again
+    if (roundNumber.value <= 1) {
+      clearUsedWords()
+    }
 
     let players = [...roomStore.connectedPlayers]
     if (!players.length) {
@@ -165,6 +197,7 @@ export const useGameStore = defineStore('game', () => {
     const drawerIndex = (Math.max(1, roundNumber.value) - 1) % Math.max(1, players.length)
     drawerId.value = players[drawerIndex]?.user_id || auth.user?.id || null
 
+    // Fresh random options every round / role change (excludes used words)
     wordChoices.value = await fetchWordChoices(room.language || 'id', room.word_difficulty || 'medium')
     phase.value = 'selecting' // leave scoreboard / revealing
     startTimer(WORD_SELECT_TIME)
@@ -211,9 +244,18 @@ export const useGameStore = defineStore('game', () => {
     correctGuessers.value = new Set()
 
     if (payload.wordChoices?.length) {
-      wordChoices.value = payload.wordChoices
+      // Still re-shuffle if payload is stale/shared; prefer exclusive unused set for local drawer
+      if (payload.drawerId && payload.drawerId === auth.user?.id) {
+        const room = roomStore.room
+        wordChoices.value = await fetchWordChoices(
+          room?.language || 'id',
+          room?.word_difficulty || 'medium',
+        )
+      } else {
+        wordChoices.value = payload.wordChoices
+      }
     } else if (payload.drawerId && payload.drawerId === auth.user?.id) {
-      // We are the drawer but host didn't send choices — load locally
+      // We are the drawer but host didn't send choices — load fresh random set
       const room = roomStore.room
       wordChoices.value = await fetchWordChoices(
         room?.language || 'id',
@@ -253,33 +295,116 @@ export const useGameStore = defineStore('game', () => {
   }
 
   async function fetchWordChoices(lang: string, difficulty: string): Promise<WordChoice[]> {
+    const isId = lang === 'id'
+    const usedKeys = usedWordKeys.value
+    const usedIds = usedWordIds.value
+
+    const mapRow = (w: {
+      id: string
+      word_en: string
+      word_id: string
+      difficulty: string
+    }): WordChoice => ({
+      id: w.id,
+      text: isId ? w.word_id : w.word_en,
+      difficulty: w.difficulty as WordChoice['difficulty'],
+    })
+
+    const pickThree = (pool: WordChoice[]): WordChoice[] => {
+      const fresh = pool.filter(
+        w => !usedIds.has(w.id) && !usedKeys.has(wordKey(w.text)),
+      )
+      // Prefer unused; if pool exhausted mid-match, reshuffle full pool
+      const source = fresh.length >= 3 ? fresh : (fresh.length > 0 ? fresh : pool)
+      if (fresh.length < 3 && fresh.length > 0 && pool.length > fresh.length) {
+        // Mix a few unused with random others only if we can't fill 3
+        const rest = shuffleInPlace(pool.filter(w => !fresh.includes(w)))
+        const mixed = shuffleInPlace([...fresh, ...rest])
+        // Prefer unique texts in the 3 shown
+        const out: WordChoice[] = []
+        const seen = new Set<string>()
+        for (const w of mixed) {
+          const k = wordKey(w.text)
+          if (seen.has(k)) continue
+          seen.add(k)
+          out.push(w)
+          if (out.length >= 3) break
+        }
+        return out
+      }
+      const shuffled = shuffleInPlace([...source])
+      const out: WordChoice[] = []
+      const seen = new Set<string>()
+      for (const w of shuffled) {
+        const k = wordKey(w.text)
+        if (seen.has(k)) continue
+        seen.add(k)
+        out.push(w)
+        if (out.length >= 3) break
+      }
+      return out
+    }
+
     const client = useSupabase()
     if (client) {
-      let q = client.from('words').select('id, word_en, word_id, difficulty').eq('is_active', true).limit(50)
+      // Larger pool so re-rolls stay fresh across rounds
+      let q = client
+        .from('words')
+        .select('id, word_en, word_id, difficulty')
+        .eq('is_active', true)
+        .limit(200)
       if (difficulty !== 'mixed') {
         q = q.eq('difficulty', difficulty)
       }
       const { data } = await q
       if (data?.length) {
-        const shuffled = [...data].sort(() => Math.random() - 0.5).slice(0, 3)
-        return shuffled.map(w => ({
-          id: w.id,
-          text: lang === 'id' ? w.word_id : w.word_en,
-          difficulty: w.difficulty as WordChoice['difficulty'],
-        }))
+        const pool = data.map(mapRow)
+        const choices = pickThree(pool)
+        if (choices.length) return choices
       }
     }
 
-    // Demo fallback
-    const demo = [
-      { id: '1', text: lang === 'id' ? 'Kucing' : 'Cat', difficulty: 'easy' as const },
-      { id: '2', text: lang === 'id' ? 'Pesawat' : 'Airplane', difficulty: 'easy' as const },
-      { id: '3', text: lang === 'id' ? 'Pizza' : 'Pizza', difficulty: 'easy' as const },
-      { id: '4', text: lang === 'id' ? 'Gajah' : 'Elephant', difficulty: 'medium' as const },
-      { id: '5', text: lang === 'id' ? 'Robot' : 'Robot', difficulty: 'easy' as const },
-      { id: '6', text: lang === 'id' ? 'Sepeda' : 'Bicycle', difficulty: 'easy' as const },
+    // Demo fallback — larger list so multi-round games don't loop the same 3
+    const demo: WordChoice[] = [
+      { id: 'd1', text: isId ? 'Kucing' : 'Cat', difficulty: 'easy' },
+      { id: 'd2', text: isId ? 'Pesawat' : 'Airplane', difficulty: 'easy' },
+      { id: 'd3', text: isId ? 'Pizza' : 'Pizza', difficulty: 'easy' },
+      { id: 'd4', text: isId ? 'Gajah' : 'Elephant', difficulty: 'medium' },
+      { id: 'd5', text: isId ? 'Robot' : 'Robot', difficulty: 'easy' },
+      { id: 'd6', text: isId ? 'Sepeda' : 'Bicycle', difficulty: 'easy' },
+      { id: 'd7', text: isId ? 'Rumah' : 'House', difficulty: 'easy' },
+      { id: 'd8', text: isId ? 'Pohon' : 'Tree', difficulty: 'easy' },
+      { id: 'd9', text: isId ? 'Mobil' : 'Car', difficulty: 'easy' },
+      { id: 'd10', text: isId ? 'Bola' : 'Ball', difficulty: 'easy' },
+      { id: 'd11', text: isId ? 'Ikan' : 'Fish', difficulty: 'easy' },
+      { id: 'd12', text: isId ? 'Matahari' : 'Sun', difficulty: 'easy' },
+      { id: 'd13', text: isId ? 'Gunung' : 'Mountain', difficulty: 'medium' },
+      { id: 'd14', text: isId ? 'Payung' : 'Umbrella', difficulty: 'medium' },
+      { id: 'd15', text: isId ? 'Gitar' : 'Guitar', difficulty: 'medium' },
+      { id: 'd16', text: isId ? 'Kamera' : 'Camera', difficulty: 'medium' },
+      { id: 'd17', text: isId ? 'Nanas' : 'Pineapple', difficulty: 'medium' },
+      { id: 'd18', text: isId ? 'Kepiting' : 'Crab', difficulty: 'medium' },
+      { id: 'd19', text: isId ? 'Helikopter' : 'Helicopter', difficulty: 'hard' },
+      { id: 'd20', text: isId ? 'Perpustakaan' : 'Library', difficulty: 'hard' },
+      { id: 'd21', text: isId ? 'Jembatan' : 'Bridge', difficulty: 'medium' },
+      { id: 'd22', text: isId ? 'Pelangi' : 'Rainbow', difficulty: 'medium' },
+      { id: 'd23', text: isId ? 'Dinosaurus' : 'Dinosaur', difficulty: 'hard' },
+      { id: 'd24', text: isId ? 'Sepatu' : 'Shoe', difficulty: 'easy' },
     ]
-    return demo.sort(() => Math.random() - 0.5).slice(0, 3)
+    return pickThree(demo)
+  }
+
+  /** Public re-roll for current drawer (selecting phase only) */
+  async function reloadWordChoices() {
+    const room = roomStore.room
+    wordChoices.value = await fetchWordChoices(
+      room?.language || 'id',
+      room?.word_difficulty || 'medium',
+    )
+    if (roomStore.currentRound) {
+      roomStore.currentRound.word_choices = wordChoices.value
+    }
+    return wordChoices.value
   }
 
   function selectWord(choice: WordChoice) {
@@ -295,6 +420,7 @@ export const useGameStore = defineStore('game', () => {
 
     // New word = blank canvas (drop leftover strokes from previous turn)
     wipeStrokes()
+    markWordUsed(choice.text, choice.id)
     selectedWord.value = choice.text
     wordHint.value = buildWordHint(choice.text, 0)
     phase.value = 'drawing' // ← critical UI switch
@@ -356,6 +482,8 @@ export const useGameStore = defineStore('game', () => {
   }) {
     // Fresh board every time a word is picked (prevents stacked old drawings)
     wipeStrokes()
+    // Track so next local fetch as drawer won't offer the same word
+    markWordUsed(payload.word)
     // Keep remote drawer — never overwrite with self
     if (payload.drawerId) {
       drawerId.value = payload.drawerId
@@ -695,6 +823,7 @@ export const useGameStore = defineStore('game', () => {
     clearTimers()
 
     // Force leave scoreboard / winner → selecting with new drawer
+    // Empty wordChoices → drawer re-fetches a fresh random set (unused words)
     await applyRemoteRound({
       phase: 'selecting',
       roundNumber: payload.roundNumber,
@@ -718,6 +847,8 @@ export const useGameStore = defineStore('game', () => {
     drawerId.value = null
     selectedWord.value = null
     strokes.value = []
+    clearUsedWords()
+    wordChoices.value = []
     winnerId.value = null
     roomStore.persistLocal()
   }
@@ -753,6 +884,7 @@ export const useGameStore = defineStore('game', () => {
     emotes.value = []
     lastScores.value = []
     winnerId.value = null
+    clearUsedWords()
   }
 
   return {
@@ -775,8 +907,12 @@ export const useGameStore = defineStore('game', () => {
     displayWord,
     beginRound,
     applyRemoteRound,
+    fetchWordChoices,
+    reloadWordChoices,
     selectWord,
     onRemoteWordSelected,
+    markWordUsed,
+    clearUsedWords,
     addStroke,
     applyRemoteStrokes,
     undo,
