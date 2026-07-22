@@ -24,7 +24,11 @@ export function useGsap() {
   }
 
   function staggerChildren(parent: Element | string, childSel = ':scope > *', vars?: gsap.TweenVars) {
-    return gsap.from(childSel, {
+    const parentEl = typeof parent === 'string' ? document.querySelector(parent) : parent
+    if (!parentEl) return
+    const targets = parentEl.querySelectorAll(childSel)
+    if (!targets.length) return
+    return gsap.from(targets, {
       opacity: 0,
       y: 16,
       duration: 0.3,
