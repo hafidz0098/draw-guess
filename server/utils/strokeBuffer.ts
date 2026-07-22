@@ -79,13 +79,13 @@ export function getStrokesAfter(roomId: string, afterSeq: number): BufferedStrok
   return b.items.filter(i => i.seq > afterSeq)
 }
 
-export function clearRoomStrokes(roomId: string) {
+export function clearRoomStrokes(roomId: string, userId: string) {
   const b = getBuf(roomId)
   b.seq += 1
   b.items.push({
     id: `${roomId}-${b.seq}`,
     room_id: roomId,
-    user_id: 'system',
+    user_id: userId,
     seq: b.seq,
     kind: 'clear',
     round_id: 'clear',

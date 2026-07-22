@@ -58,7 +58,7 @@ export default defineEventHandler(async (event) => {
   const userId = userData.user.id
 
   if (data.kind === 'clear') {
-    clearRoomStrokes(data.room_id)
+    clearRoomStrokes(data.room_id, userId)
     return { ok: true, kind: 'clear' }
   }
 

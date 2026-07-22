@@ -744,7 +744,9 @@ function setupCanvas(forceResize = true) {
     for (const s of strokes.value) {
       if (s.points?.length >= 2) {
         const meta = (s.shape_data || {}) as { canvas_w?: number; canvas_h?: number; normalized?: boolean }
-        const local = toLocalPoints(s.points, { ...meta, normalized: meta.normalized ?? true })
+        // Do not force normalized:true — local (own) strokes have no shape_data and are
+        // already in raw canvas-pixel space; toLocalPoints() auto-detects via point range.
+        const local = toLocalPoints(s.points, meta)
         paintSegmentRaw(local, s.color, s.size, !!(s.is_eraser || s.tool === 'eraser'))
       }
     }
@@ -901,9 +903,8 @@ function up(e: PointerEvent) {
   if (ctx) ctx.globalCompositeOperation = 'source-over'
 }
 
-function clearAll() {
-  if (!canDraw.value) return
-  game.clearCanvas()
+/** Wipe + redraw local canvas, then resync remaining strokes (if any) to server + peer */
+function broadcastResync() {
   channel.sendClear()
   void postStrokeServer({ kind: 'clear' })
   seenLiveSeq.clear()
@@ -911,6 +912,27 @@ function clearAll() {
   protectCanvas = false
   setupCanvas(true)
   protectCanvas = true
+  if (game.strokes.length) {
+    void relayCommitStrokes(game.strokes)
+  }
+}
+
+function clearAll() {
+  if (!canDraw.value) return
+  game.clearCanvas()
+  broadcastResync()
+}
+
+function undoLast() {
+  if (!canDraw.value) return
+  game.undo()
+  broadcastResync()
+}
+
+function redoLast() {
+  if (!canDraw.value) return
+  game.redo()
+  broadcastResync()
 }
 </script>
 
@@ -1003,7 +1025,30 @@ function clearAll() {
         </select>
         <button
           type="button"
-          style="margin-left:auto;background:#dc2626;color:#fff;border:none;border-radius:10px;padding:8px 14px;font-weight:800;cursor:pointer;"
+          :disabled="!game.undoStack.length"
+          :style="{
+            marginLeft: 'auto', background: '#334155', color: '#fff', border: 'none', borderRadius: '10px',
+            padding: '8px 14px', fontWeight: 800,
+            opacity: game.undoStack.length ? 1 : 0.4, cursor: game.undoStack.length ? 'pointer' : 'not-allowed',
+          }"
+          @click="undoLast"
+        >
+          ↩️ Undo
+        </button>
+        <button
+          type="button"
+          :disabled="!game.redoStack.length"
+          :style="{
+            background: '#334155', color: '#fff', border: 'none', borderRadius: '10px', padding: '8px 14px', fontWeight: 800,
+            opacity: game.redoStack.length ? 1 : 0.4, cursor: game.redoStack.length ? 'pointer' : 'not-allowed',
+          }"
+          @click="redoLast"
+        >
+          ↪️ Redo
+        </button>
+        <button
+          type="button"
+          style="background:#dc2626;color:#fff;border:none;border-radius:10px;padding:8px 14px;font-weight:800;cursor:pointer;"
           @click="clearAll"
         >
           Clear

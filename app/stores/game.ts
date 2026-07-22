@@ -859,6 +859,8 @@ export const useGameStore = defineStore('game', () => {
     selectedWord,
     wordHint,
     strokes,
+    undoStack,
+    redoStack,
     correctGuessers,
     timeLeft,
     remoteCursors,
