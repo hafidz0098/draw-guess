@@ -29,3 +29,6 @@ Thumbs.db
 # Misc
 *.local
 coverage
+
+# Supabase CLI temp
+supabase/.temp/
