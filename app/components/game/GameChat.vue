@@ -200,10 +200,8 @@ async function send() {
   }
 
   if (game.canGuess) {
-    // sendChat already persists via /api/rooms/chat — only broadcast (no 2nd POST)
-    const guessMsg = await roomStore.sendChat(text, 'guess')
-    if (guessMsg) await pushAndBroadcast(guessMsg)
-
+    // Check correctness BEFORE broadcasting anything — a correct guess must
+    // never appear verbatim in chat, or every other guesser gets a free answer.
     const result = await game.submitGuess(text)
 
     if (result.correct) {
@@ -222,7 +220,6 @@ async function send() {
         points: result.points,
         is_first: result.isFirst,
         all_done: result.allDone,
-        guess_text: text,
         word: result.allDone ? game.selectedWord : undefined,
         scores,
       })
@@ -237,6 +234,11 @@ async function send() {
         }, 2500)
       }
     } else {
+      // Wrong guess — safe to show verbatim (no answer leaked).
+      // sendChat already persists via /api/rooms/chat — only broadcast (no 2nd POST)
+      const guessMsg = await roomStore.sendChat(text, 'guess')
+      if (guessMsg) await pushAndBroadcast(guessMsg)
+
       play('wrong')
       await channel.sendGame('guess_result', {
         correct: false,
