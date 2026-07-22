@@ -916,13 +916,6 @@ function clearAll() {
 
 <template>
   <div style="min-height:100vh;background:#0f172a;color:#f8fafc;padding:12px;">
-    <div style="background:#000;border:1px solid #475569;border-radius:8px;padding:8px 12px;margin-bottom:12px;font-family:monospace;font-size:12px;">
-      phase=<b style="color:#fb923c">{{ phase }}</b>
-      · role=<b :style="{ color: isDrawer ? '#4ade80' : '#60a5fa' }">{{ isDrawer ? 'DRAWER' : 'GUESSER' }}</b>
-      · {{ isDrawer ? (selectedWord || '—') : hintDisplay }}
-      · ⏱{{ timeLeft }}s · {{ statusMsg }}
-    </div>
-
     <div v-if="loading" style="text-align:center;padding:48px;color:#94a3b8">
       Memuat... {{ statusMsg }}
     </div>
