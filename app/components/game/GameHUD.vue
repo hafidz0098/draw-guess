@@ -34,6 +34,20 @@ const hintChars = computed(() => {
       ⏱ {{ game.timeLeft }}s
     </div>
 
+    <!-- HINT FOR GUESSER -->
+    <div v-if="game.wordHint?.length && !game.isDrawer" class="flex flex-col items-center gap-1 bg-slate-800/70 px-3 py-2 rounded-xl">
+      <div class="text-xs text-slate-400 flex items-center gap-1">
+        👀 Hint
+        <button
+          @click="game.revealAllHint"
+          class="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-0.5 rounded font-bold transition"
+        >
+          Lihat Jawaban
+        </button>
+      </div>
+      <div class="font-mono text-xl tracking-widest text-sky-400">{{ game.hintDisplay }}</div>
+    </div>
+
     <div class="flex flex-wrap items-center justify-center gap-1">
       <template v-if="game.isDrawer && game.selectedWord">
         <span class="mr-2 text-sm font-bold text-slate-400">Gambar:</span>

@@ -296,102 +296,51 @@ export const useGameStore = defineStore('game', () => {
 
   async function fetchWordChoices(lang: string, difficulty: string): Promise<WordChoice[]> {
     const isId = lang === 'id'
-    const usedKeys = usedWordKeys.value
-    const usedIds = usedWordIds.value
-
-    const mapRow = (w: {
-      id: string
-      word_en: string
-      word_id: string
-      difficulty: string
-    }): WordChoice => ({
-      id: w.id,
-      text: isId ? w.word_id : w.word_en,
-      difficulty: w.difficulty as WordChoice['difficulty'],
-    })
-
-    const pickThree = (pool: WordChoice[]): WordChoice[] => {
-      const fresh = pool.filter(
-        w => !usedIds.has(w.id) && !usedKeys.has(wordKey(w.text)),
-      )
-      // Prefer unused; if pool exhausted mid-match, reshuffle full pool
-      const source = fresh.length >= 3 ? fresh : (fresh.length > 0 ? fresh : pool)
-      if (fresh.length < 3 && fresh.length > 0 && pool.length > fresh.length) {
-        // Mix a few unused with random others only if we can't fill 3
-        const rest = shuffleInPlace(pool.filter(w => !fresh.includes(w)))
-        const mixed = shuffleInPlace([...fresh, ...rest])
-        // Prefer unique texts in the 3 shown
-        const out: WordChoice[] = []
-        const seen = new Set<string>()
-        for (const w of mixed) {
-          const k = wordKey(w.text)
-          if (seen.has(k)) continue
-          seen.add(k)
-          out.push(w)
-          if (out.length >= 3) break
-        }
-        return out
-      }
-      const shuffled = shuffleInPlace([...source])
-      const out: WordChoice[] = []
-      const seen = new Set<string>()
-      for (const w of shuffled) {
-        const k = wordKey(w.text)
-        if (seen.has(k)) continue
-        seen.add(k)
-        out.push(w)
-        if (out.length >= 3) break
-      }
-      return out
-    }
-
     const client = useSupabase()
     if (client) {
-      // Larger pool so re-rolls stay fresh across rounds
-      let q = client
-        .from('words')
-        .select('id, word_en, word_id, difficulty')
-        .eq('is_active', true)
-        .limit(200)
+      let q = client.from('words').select('id, word_en, word_id, difficulty').eq('is_active', true).limit(50)
       if (difficulty !== 'mixed') {
         q = q.eq('difficulty', difficulty)
       }
       const { data } = await q
       if (data?.length) {
-        const pool = data.map(mapRow)
-        const choices = pickThree(pool)
-        if (choices.length) return choices
+        const shuffled = [...data].sort(() => Math.random() - 0.5).slice(0, 3)
+        return shuffled.map(w => ({
+          id: w.id,
+          text: isId ? w.word_id : w.word_en,
+          difficulty: w.difficulty as WordChoice['difficulty'],
+        }))
       }
     }
 
-    // Demo fallback — larger list so multi-round games don't loop the same 3
-    const demo: WordChoice[] = [
-      { id: 'd1', text: isId ? 'Kucing' : 'Cat', difficulty: 'easy' },
-      { id: 'd2', text: isId ? 'Pesawat' : 'Airplane', difficulty: 'easy' },
-      { id: 'd3', text: isId ? 'Pizza' : 'Pizza', difficulty: 'easy' },
-      { id: 'd4', text: isId ? 'Gajah' : 'Elephant', difficulty: 'medium' },
-      { id: 'd5', text: isId ? 'Robot' : 'Robot', difficulty: 'easy' },
-      { id: 'd6', text: isId ? 'Sepeda' : 'Bicycle', difficulty: 'easy' },
-      { id: 'd7', text: isId ? 'Rumah' : 'House', difficulty: 'easy' },
-      { id: 'd8', text: isId ? 'Pohon' : 'Tree', difficulty: 'easy' },
-      { id: 'd9', text: isId ? 'Mobil' : 'Car', difficulty: 'easy' },
-      { id: 'd10', text: isId ? 'Bola' : 'Ball', difficulty: 'easy' },
-      { id: 'd11', text: isId ? 'Ikan' : 'Fish', difficulty: 'easy' },
-      { id: 'd12', text: isId ? 'Matahari' : 'Sun', difficulty: 'easy' },
-      { id: 'd13', text: isId ? 'Gunung' : 'Mountain', difficulty: 'medium' },
-      { id: 'd14', text: isId ? 'Payung' : 'Umbrella', difficulty: 'medium' },
-      { id: 'd15', text: isId ? 'Gitar' : 'Guitar', difficulty: 'medium' },
-      { id: 'd16', text: isId ? 'Kamera' : 'Camera', difficulty: 'medium' },
-      { id: 'd17', text: isId ? 'Nanas' : 'Pineapple', difficulty: 'medium' },
-      { id: 'd18', text: isId ? 'Kepiting' : 'Crab', difficulty: 'medium' },
-      { id: 'd19', text: isId ? 'Helikopter' : 'Helicopter', difficulty: 'hard' },
-      { id: 'd20', text: isId ? 'Perpustakaan' : 'Library', difficulty: 'hard' },
-      { id: 'd21', text: isId ? 'Jembatan' : 'Bridge', difficulty: 'medium' },
-      { id: 'd22', text: isId ? 'Pelangi' : 'Rainbow', difficulty: 'medium' },
-      { id: 'd23', text: isId ? 'Dinosaurus' : 'Dinosaur', difficulty: 'hard' },
-      { id: 'd24', text: isId ? 'Sepatu' : 'Shoe', difficulty: 'easy' },
+    // Demo fallback
+    const demo = [
+      { id: '1', text: isId ? 'Kucing' : 'Cat', difficulty: 'easy' as const },
+      { id: '2', text: isId ? 'Pesawat' : 'Airplane', difficulty: 'easy' as const },
+      { id: '3', text: isId ? 'Pizza' : 'Pizza', difficulty: 'easy' as const },
+      { id: '4', text: isId ? 'Gajah' : 'Elephant', difficulty: 'medium' as const },
+      { id: '5', text: isId ? 'Robot' : 'Robot', difficulty: 'easy' as const },
+      { id: '6', text: isId ? 'Sepeda' : 'Bicycle', difficulty: 'easy' as const },
+      { id: '7', text: isId ? 'Rumah' : 'House', difficulty: 'easy' as const },
+      { id: '8', text: isId ? 'Pohon' : 'Tree', difficulty: 'easy' as const },
+      { id: '9', text: isId ? 'Mobil' : 'Car', difficulty: 'easy' as const },
+      { id: '10', text: isId ? 'Bola' : 'Ball', difficulty: 'easy' as const },
+      { id: '11', text: isId ? 'Ikan' : 'Fish', difficulty: 'easy' as const },
+      { id: '12', text: isId ? 'Matahari' : 'Sun', difficulty: 'easy' as const },
+      { id: '13', text: isId ? 'Gunung' : 'Mountain', difficulty: 'medium' as const },
+      { id: '14', text: isId ? 'Payung' : 'Umbrella', difficulty: 'medium' as const },
+      { id: '15', text: isId ? 'Gitar' : 'Guitar', difficulty: 'medium' as const },
+      { id: '16', text: isId ? 'Kamera' : 'Camera', difficulty: 'medium' as const },
+      { id: '17', text: isId ? 'Nanas' : 'Pineapple', difficulty: 'medium' as const },
+      { id: '18', text: isId ? 'Kepiting' : 'Crab', difficulty: 'medium' as const },
+      { id: '19', text: isId ? 'Helikopter' : 'Helicopter', difficulty: 'hard' as const },
+      { id: '20', text: isId ? 'Perpustakaan' : 'Library', difficulty: 'hard' as const },
+      { id: '21', text: isId ? 'Jembatan' : 'Bridge', difficulty: 'medium' as const },
+      { id: '22', text: isId ? 'Pelangi' : 'Rainbow', difficulty: 'medium' as const },
+      { id: '23', text: isId ? 'Dinosaurus' : 'Dinosaur', difficulty: 'hard' as const },
+      { id: '24', text: isId ? 'Sepatu' : 'Shoe', difficulty: 'easy' as const },
     ]
-    return pickThree(demo)
+    return demo.sort(() => Math.random() - 0.5).slice(0, 3)
   }
 
   /** Public re-roll for current drawer (selecting phase only) */
@@ -528,8 +477,11 @@ export const useGameStore = defineStore('game', () => {
     if (hintInterval) clearInterval(hintInterval)
     const letters = word.replace(/ /g, '').length
     const maxReveal = Math.max(0, Math.floor(letters / 2))
-    if (maxReveal === 0) return
-    const intervalMs = (drawTime * 1000) / (maxReveal + 1)
+    if (maxReveal === 0) {
+      wordHint.value = [word]
+      return
+    }
+    const intervalMs = Math.max(800, (drawTime * 1000) / (maxReveal + 1)) // min 800ms per reveal
     let revealed = 0
     hintInterval = setInterval(() => {
       revealed++
@@ -539,6 +491,13 @@ export const useGameStore = defineStore('game', () => {
       }
       wordHint.value = buildWordHint(word, revealed)
     }, intervalMs)
+  }
+
+  /** Manual reveal all letters (guesser button) */
+  function revealAllHint() {
+    const letters = selectedWord.value?.replace(/ /g, '') || ''
+    wordHint.value = [letters]
+    clearTimers()
   }
 
   function addStroke(stroke: Omit<DrawingStroke, 'sequence' | 'timestamp_ms' | 'round_id'>) {
