@@ -45,7 +45,7 @@ const hintChars = computed(() => {
           Lihat Jawaban
         </button>
       </div>
-      <div class="font-mono text-xl tracking-widest text-sky-400">{{ game.hintDisplay }}</div>
+      <div class="font-mono text-xl tracking-widest text-sky-400">{{ game.displayWord }}</div>
     </div>
 
     <div class="flex flex-wrap items-center justify-center gap-1">

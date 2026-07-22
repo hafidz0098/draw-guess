@@ -874,6 +874,7 @@ export const useGameStore = defineStore('game', () => {
     fetchWordChoices,
     reloadWordChoices,
     selectWord,
+    revealAllHint,
     onRemoteWordSelected,
     markWordUsed,
     clearUsedWords,
