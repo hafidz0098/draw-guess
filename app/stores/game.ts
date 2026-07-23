@@ -850,6 +850,8 @@ export const useGameStore = defineStore('game', () => {
       is_ready: m.role === 'host',
     }))
     roomStore.session = null
+    roomStore.messages = []
+    roomStore.chatClearedAt = new Date().toISOString()
     phase.value = 'idle'
     drawerId.value = null
     selectedWord.value = null

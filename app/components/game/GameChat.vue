@@ -158,9 +158,14 @@ async function pollChat() {
   const roomId = room.value?.id
   if (!roomId) return
   try {
-    // Only use "since" for messages that belong to THIS room
+    // Only use "since" for messages that belong to THIS room.
+    // Never poll earlier than chatClearedAt, or a Play Again on the same
+    // room would re-fetch the previous match's history from the server.
     const last = [...messages.value].reverse().find(m => m.room_id === roomId)
-    const since = last?.created_at
+    const since = [last?.created_at, roomStore.chatClearedAt]
+      .filter((v): v is string => !!v)
+      .sort()
+      .pop()
     const qs = new URLSearchParams({ room_id: roomId })
     if (since) qs.set('since', since)
     const res = await $fetch<{ messages: ChatMessage[] }>(`/api/rooms/chat?${qs}`)

@@ -21,6 +21,8 @@ export const useRoomStore = defineStore('room', () => {
   const typingUsers = ref<Set<string>>(new Set())
   const lastSyncAt = ref<number>(0)
   const syncError = ref<string | null>(null)
+  /** Poll floor so a cleared chat (e.g. Play Again on the same room) never re-fetches old messages */
+  const chatClearedAt = ref<string | null>(null)
 
   const auth = useAuthStore()
 
@@ -579,6 +581,7 @@ export const useRoomStore = defineStore('room', () => {
     room,
     members,
     messages,
+    chatClearedAt,
     session,
     currentRound,
     loading,
