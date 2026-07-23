@@ -3,4 +3,4 @@
 -- NULL / omitted = draw words from all categories (previous behavior).
 -- ============================================================
 
-ALTER TABLE public.rooms ADD COLUMN word_category TEXT;
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS word_category TEXT;
