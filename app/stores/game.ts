@@ -308,7 +308,7 @@ export const useGameStore = defineStore('game', () => {
         .from('words')
         .select('id, word_en, word_id, difficulty, categories!inner(slug)')
         .eq('is_active', true)
-        .limit(50)
+        .limit(150)
       if (difficulty !== 'mixed') {
         q = q.eq('difficulty', difficulty)
       }
@@ -317,7 +317,12 @@ export const useGameStore = defineStore('game', () => {
       }
       const { data } = await q
       if (data?.length) {
-        const shuffled = [...data].sort(() => Math.random() - 0.5).slice(0, 6)
+        // Exclude words already picked this match; recycle the full pool only if it's exhausted
+        const fresh = data.filter(w =>
+          !usedWordIds.value.has(w.id) && !usedWordKeys.value.has(wordKey(isId ? w.word_id : w.word_en)),
+        )
+        const pool = fresh.length >= 6 ? fresh : data
+        const shuffled = [...pool].sort(() => Math.random() - 0.5).slice(0, 6)
         return shuffled.map(w => ({
           id: w.id,
           text: isId ? w.word_id : w.word_en,
