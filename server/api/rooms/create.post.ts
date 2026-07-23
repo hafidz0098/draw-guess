@@ -18,6 +18,7 @@ const bodySchema = z.object({
     z.literal(30), z.literal(45), z.literal(60), z.literal(90),
   ]),
   word_difficulty: z.enum(['easy', 'medium', 'hard', 'mixed']),
+  word_category: z.string().max(60).nullable().optional(),
 })
 
 const genCode = customAlphabet('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', 6)
@@ -100,6 +101,7 @@ export default defineEventHandler(async (event) => {
         language: data.language,
         draw_time: data.draw_time,
         word_difficulty: data.word_difficulty,
+        word_category: data.word_category || null,
         status: 'waiting',
       })
       .select()

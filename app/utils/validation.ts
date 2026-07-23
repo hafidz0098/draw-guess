@@ -23,6 +23,7 @@ export const createRoomSchema = z.object({
     z.literal(30), z.literal(45), z.literal(60), z.literal(90),
   ]),
   word_difficulty: z.enum(['easy', 'medium', 'hard', 'mixed']),
+  word_category: z.string().max(60).nullable().optional(),
 })
 
 export const joinRoomSchema = z.object({

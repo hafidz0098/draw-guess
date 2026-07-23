@@ -109,6 +109,7 @@ export const useRoomStore = defineStore('room', () => {
           language: parsed.language,
           draw_time: parsed.draw_time,
           word_difficulty: parsed.word_difficulty,
+          word_category: parsed.word_category || null,
         },
       })
 

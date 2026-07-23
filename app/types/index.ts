@@ -93,6 +93,7 @@ export interface Room {
   language: Language
   draw_time: 30 | 45 | 60 | 90
   word_difficulty: Difficulty
+  word_category: string | null
   status: RoomStatus
   current_round: number
   settings: Record<string, unknown>
@@ -325,6 +326,7 @@ export interface CreateRoomInput {
   language: Language
   draw_time: 30 | 45 | 60 | 90
   word_difficulty: Difficulty
+  word_category?: string | null
 }
 
 export interface DrawToolState {

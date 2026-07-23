@@ -7,7 +7,7 @@ import {
   DIFFICULTY_OPTIONS,
   LANGUAGE_OPTIONS,
 } from '~/utils/constants'
-import type { CreateRoomInput } from '~/types'
+import type { Category, CreateRoomInput } from '~/types'
 
 const auth = useAuthStore()
 const room = useRoomStore()
@@ -21,7 +21,10 @@ const form = reactive<CreateRoomInput>({
   language: 'id',
   draw_time: 60,
   word_difficulty: 'medium',
+  word_category: null,
 })
+
+const categories = ref<Category[]>([])
 
 onMounted(async () => {
   await auth.init()
@@ -32,6 +35,15 @@ onMounted(async () => {
   }
   if (auth.profile) {
     form.name = `Room ${auth.profile.nickname}`
+  }
+
+  const client = useSupabase()
+  if (client) {
+    const { data } = await client
+      .from('categories')
+      .select('id, name_en, name_id, slug, icon')
+      .order('name_id')
+    if (data) categories.value = data as Category[]
   }
 })
 
@@ -154,6 +166,31 @@ async function submit() {
             @click="form.word_difficulty = d"
           >
             {{ d }}
+          </button>
+        </div>
+      </div>
+
+      <div>
+        <label class="label">Kategori</label>
+        <div class="flex flex-wrap gap-2">
+          <button
+            type="button"
+            class="rounded-xl px-3 py-2 text-sm font-bold transition-colors"
+            :class="!form.word_category ? 'bg-brand-orange-500 text-white' : 'bg-surface-tertiary text-slate-600 dark:bg-slate-700 dark:text-slate-200'"
+            @click="form.word_category = null"
+          >
+            Semua
+          </button>
+          <button
+            v-for="c in categories"
+            :key="c.id"
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-bold transition-colors"
+            :class="form.word_category === c.slug ? 'bg-brand-orange-500 text-white' : 'bg-surface-tertiary text-slate-600 dark:bg-slate-700 dark:text-slate-200'"
+            @click="form.word_category = c.slug"
+          >
+            <Icon :name="`mdi:${c.icon}`" class="h-4 w-4" />
+            {{ form.language === 'en' ? c.name_en : c.name_id }}
           </button>
         </div>
       </div>

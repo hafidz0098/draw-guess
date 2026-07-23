@@ -198,7 +198,7 @@ export const useGameStore = defineStore('game', () => {
     drawerId.value = players[drawerIndex]?.user_id || auth.user?.id || null
 
     // Fresh random options every round / role change (excludes used words)
-    wordChoices.value = await fetchWordChoices(room.language || 'id', room.word_difficulty || 'medium')
+    wordChoices.value = await fetchWordChoices(room.language || 'id', room.word_difficulty || 'medium', room.word_category)
     phase.value = 'selecting' // leave scoreboard / revealing
     startTimer(WORD_SELECT_TIME)
 
@@ -250,6 +250,7 @@ export const useGameStore = defineStore('game', () => {
         wordChoices.value = await fetchWordChoices(
           room?.language || 'id',
           room?.word_difficulty || 'medium',
+          room?.word_category,
         )
       } else {
         wordChoices.value = payload.wordChoices
@@ -260,6 +261,7 @@ export const useGameStore = defineStore('game', () => {
       wordChoices.value = await fetchWordChoices(
         room?.language || 'id',
         room?.word_difficulty || 'medium',
+        room?.word_category,
       )
     } else {
       wordChoices.value = []
@@ -294,17 +296,28 @@ export const useGameStore = defineStore('game', () => {
     }
   }
 
-  async function fetchWordChoices(lang: string, difficulty: string): Promise<WordChoice[]> {
+  async function fetchWordChoices(
+    lang: string,
+    difficulty: string,
+    category?: string | null,
+  ): Promise<WordChoice[]> {
     const isId = lang === 'id'
     const client = useSupabase()
     if (client) {
-      let q = client.from('words').select('id, word_en, word_id, difficulty').eq('is_active', true).limit(50)
+      let q = client
+        .from('words')
+        .select('id, word_en, word_id, difficulty, categories!inner(slug)')
+        .eq('is_active', true)
+        .limit(50)
       if (difficulty !== 'mixed') {
         q = q.eq('difficulty', difficulty)
       }
+      if (category) {
+        q = q.eq('categories.slug', category)
+      }
       const { data } = await q
       if (data?.length) {
-        const shuffled = [...data].sort(() => Math.random() - 0.5).slice(0, 3)
+        const shuffled = [...data].sort(() => Math.random() - 0.5).slice(0, 6)
         return shuffled.map(w => ({
           id: w.id,
           text: isId ? w.word_id : w.word_en,
@@ -340,7 +353,7 @@ export const useGameStore = defineStore('game', () => {
       { id: '23', text: isId ? 'Dinosaurus' : 'Dinosaur', difficulty: 'hard' as const },
       { id: '24', text: isId ? 'Sepatu' : 'Shoe', difficulty: 'easy' as const },
     ]
-    return demo.sort(() => Math.random() - 0.5).slice(0, 3)
+    return demo.sort(() => Math.random() - 0.5).slice(0, 6)
   }
 
   /** Public re-roll for current drawer (selecting phase only) */
@@ -349,6 +362,7 @@ export const useGameStore = defineStore('game', () => {
     wordChoices.value = await fetchWordChoices(
       room?.language || 'id',
       room?.word_difficulty || 'medium',
+      room?.word_category,
     )
     if (roomStore.currentRound) {
       roomStore.currentRound.word_choices = wordChoices.value
