@@ -487,6 +487,30 @@ export const useGameStore = defineStore('game', () => {
     }
   }
 
+  /** Rehydrate an in-progress round from a server snapshot (page refresh resume) */
+  function resumeRound(snapshot: {
+    phase: 'selecting' | 'drawing' | 'revealing' | 'scoreboard' | 'winner'
+    roundNumber: number
+    drawerId: string | null
+    selectedWord: string | null
+    timerEndsAt: number | null
+  }) {
+    phase.value = snapshot.phase
+    roundNumber.value = snapshot.roundNumber
+    drawerId.value = snapshot.drawerId
+    selectedWord.value = snapshot.selectedWord
+    correctGuessers.value = new Set()
+
+    const remainingMs = snapshot.timerEndsAt ? snapshot.timerEndsAt - Date.now() : 0
+    const remainingSec = Math.max(1, Math.ceil(remainingMs / 1000))
+    startTimer(remainingSec)
+
+    if (snapshot.phase === 'drawing' && snapshot.selectedWord) {
+      wordHint.value = buildWordHint(snapshot.selectedWord, 0)
+      startHintProgression(snapshot.selectedWord, remainingSec)
+    }
+  }
+
   function startHintProgression(word: string, drawTime: number) {
     if (hintInterval) clearInterval(hintInterval)
     const letters = word.replace(/ /g, '').length
@@ -877,6 +901,7 @@ export const useGameStore = defineStore('game', () => {
     redoStack,
     correctGuessers,
     timeLeft,
+    timerEndsAt,
     remoteCursors,
     emotes,
     lastScores,
@@ -892,6 +917,7 @@ export const useGameStore = defineStore('game', () => {
     selectWord,
     revealAllHint,
     onRemoteWordSelected,
+    resumeRound,
     markWordUsed,
     clearUsedWords,
     addStroke,

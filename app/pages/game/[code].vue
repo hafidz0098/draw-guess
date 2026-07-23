@@ -13,8 +13,8 @@ const game = useGameStore()
 const { play } = useSound()
 
 const {
-  phase, selectedWord, isDrawer, canDraw, timeLeft,
-  wordChoices, drawerId, wordHint, strokes,
+  phase, selectedWord, isDrawer, canDraw, timeLeft, timerEndsAt,
+  wordChoices, drawerId, wordHint, strokes, roundNumber,
 } = storeToRefs(game)
 const { room, isHost, connectedPlayers } = storeToRefs(roomStore)
 
@@ -122,21 +122,40 @@ onMounted(async () => {
     })
 
     statusMsg.value = 'round'
-    game.reset()
 
-    const alone = connectedPlayers.value.length <= 1
-    if (isHost.value || alone) {
-      await game.beginRound()
-      channel.sendGame('round_start', {
-        roundNumber: game.roundNumber,
-        drawerId: game.drawerId,
-        timeLeft: WORD_SELECT_TIME,
-        roundId: roomStore.currentRound?.id,
-      })
+    // Resume an in-progress round after refresh instead of restarting it
+    const snapshot = (room.value?.settings as { round?: {
+      phase: 'selecting' | 'drawing' | 'revealing' | 'scoreboard' | 'winner'
+      roundNumber: number
+      drawerId: string | null
+      selectedWord: string | null
+      timerEndsAt: number | null
+      updatedAt: number
+    } } | undefined)?.round
+    const staleCutoffMs = (room.value?.draw_time || 60) * 1000 + 30000
+    const canResume = !!snapshot
+      && Date.now() - snapshot.updatedAt < staleCutoffMs
+      && ['drawing', 'revealing', 'scoreboard'].includes(snapshot.phase)
+
+    if (canResume && snapshot) {
+      game.resumeRound(snapshot)
     } else {
-      statusMsg.value = 'wait round'
-      await new Promise(r => setTimeout(r, 600))
-      if (phase.value === 'idle') await game.beginRound()
+      game.reset()
+
+      const alone = connectedPlayers.value.length <= 1
+      if (isHost.value || alone) {
+        await game.beginRound()
+        channel.sendGame('round_start', {
+          roundNumber: game.roundNumber,
+          drawerId: game.drawerId,
+          timeLeft: WORD_SELECT_TIME,
+          roundId: roomStore.currentRound?.id,
+        })
+      } else {
+        statusMsg.value = 'wait round'
+        await new Promise(r => setTimeout(r, 600))
+        if (phase.value === 'idle') await game.beginRound()
+      }
     }
 
     startStrokePoll()
@@ -459,6 +478,33 @@ async function postStrokeServer(body: Record<string, unknown>) {
     console.warn('[stroke] server post failed', e)
   }
 }
+
+/** Persist a snapshot of the round so a page refresh can resume instead of restarting it */
+async function syncRoundSnapshot() {
+  if (!room.value?.id || phase.value === 'idle') return
+  const token = await auth.getAccessToken()
+  if (!token) return
+  try {
+    await $fetch('/api/rooms/round', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: {
+        room_id: room.value.id,
+        phase: phase.value,
+        round_number: roundNumber.value || 1,
+        drawer_id: drawerId.value || null,
+        selected_word: selectedWord.value || null,
+        timer_ends_at: timerEndsAt.value || null,
+      },
+    })
+  } catch (e) {
+    console.warn('[round] snapshot sync failed', e)
+  }
+}
+
+watch(phase, (p) => {
+  if (p !== 'idle') void syncRoundSnapshot()
+})
 
 function currentDrawSessionId(): string {
   return drawingSessionId.value
